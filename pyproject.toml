@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "fast-context"
+version = "1.3.0"
+description = "Python-first fast repository context search powered by Windsurf's reverse-engineered SWE-grep protocol"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.10"
+dependencies = []
+
+[project.scripts]
+fast-context = "fast_context_cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+py-modules = ["core", "extract_key", "fast_context_cli"]

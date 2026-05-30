@@ -1,9 +1,5 @@
-node_modules/
 .DS_Store
 *.log
-
-# Local MCP config (may contain secrets)
-.mcp.json
 
 # Local docs (not for distribution)
 localdocs/
@@ -19,6 +15,3 @@ dist/
 build/
 uv.lock
 test_*.py
-
-# Old Node.js dev copy
-fast-context-mcp-node/

@@ -24,7 +24,7 @@ This repo implements the local side in Python so it is easy to run in a skill wi
 ## Files
 
 ```text
-fast-context-mcp/
+fast-context/
 ├── src/
 │   ├── core.py               # Protocol, search loop, repo map, local lexical anchors
 │   ├── extract_key.py        # Windsurf credential extraction from state.vscdb

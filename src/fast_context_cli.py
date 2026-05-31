@@ -36,7 +36,7 @@ def _build_parser() -> argparse.ArgumentParser:
     search_parser.add_argument("--timeout-ms", type=int, default=30000, help="Streaming timeout in ms")
     search_parser.add_argument(
         "--backend",
-        choices=["hybrid", "remote", "local", "auto"],
+        choices=["hybrid", "remote", "local"],
         default="hybrid",
         help=(
             "Search backend. hybrid prefetches local Semble chunks, injects them "

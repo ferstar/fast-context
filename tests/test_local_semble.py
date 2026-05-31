@@ -127,7 +127,7 @@ class LocalSembleOutputTest(unittest.TestCase):
         result = core.search_with_content(
             query="hybrid search",
             project_root=str(self.project_root),
-            backend="auto",
+            backend="hybrid",
             max_results=3,
         )
 

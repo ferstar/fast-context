@@ -95,7 +95,7 @@ uv run fast-context search \
 
 Useful options:
 
-- `--backend hybrid|remote|local|auto` (`hybrid` is default; `auto` is a backward-compatible alias)
+- `--backend hybrid|remote|local` (`hybrid` is default)
 - `--tree-depth <1-6>`
 - `--max-turns <1-5>`
 - `--max-results <1-30>`

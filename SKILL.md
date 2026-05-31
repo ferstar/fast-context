@@ -59,7 +59,6 @@ python "$SKILL_DIR/src/fast_context_cli.py" find-related \
 
 - Start with defaults.
 - Default `search` uses `--backend hybrid`: Semble prefetch first, Windsurf verification second, local results as degradation if remote fails.
-- `--backend auto` is a backward-compatible alias for `hybrid`.
 - Use `--backend remote` when you need to isolate Windsurf behavior without Semble hints.
 - Use `--backend local` or `local-search` for Semble-only chunk results.
 - Lower `--tree-depth` or add `--exclude` if payloads get large.

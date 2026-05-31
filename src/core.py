@@ -2135,10 +2135,8 @@ def search_with_content(
     content_types: list[str] | None = None,
 ) -> str:
     """搜索并返回适合 CLI / skill 的格式化结果。"""
-    if backend not in {"hybrid", "auto", "remote", "local"}:
+    if backend not in {"hybrid", "remote", "local"}:
         raise ValueError(f"unknown backend: {backend}")
-    if backend == "auto":
-        backend = "hybrid"
 
     if backend == "local":
         return local_search_with_content(

@@ -563,9 +563,10 @@ class ToolExecutor:
 API_BASE = "https://server.self-serve.windsurf.com/exa.api_server_pb.ApiServerService"
 AUTH_BASE = "https://server.self-serve.windsurf.com/exa.auth_pb.AuthService"
 WS_APP = "windsurf"
+DEFAULT_WS_MODEL = "MODEL_SWE_1_6_FAST"
+DEFAULT_WS_FALLBACK_MODELS = ("MODEL_SWE_1_5",)
 WS_APP_VER = os.environ.get("WS_APP_VER", "1.48.2")
 WS_LS_VER = os.environ.get("WS_LS_VER", "1.9544.35")
-WS_MODEL = os.environ.get("WS_MODEL", "MODEL_SWE_1_6_FAST")
 
 # 系统提示模板（{max_turns} 和 {max_commands} 由调用者填入）
 SYSTEM_PROMPT_TEMPLATE = (
@@ -1091,6 +1092,51 @@ def get_api_key() -> str:
     )
 
 
+def _parse_model_env(raw: str) -> list[str]:
+    return [part.strip() for part in raw.split(",") if part.strip()]
+
+
+def _resolve_model_candidates(primary_model: str | None = None) -> list[str]:
+    primary = (primary_model or os.environ.get("WS_MODEL", DEFAULT_WS_MODEL)).strip()
+    fallback_raw = os.environ.get("WS_FALLBACK_MODELS")
+    fallback_models = (
+        list(DEFAULT_WS_FALLBACK_MODELS)
+        if fallback_raw is None
+        else _parse_model_env(fallback_raw)
+    )
+
+    ordered: list[str] = []
+    for model in [primary, *fallback_models]:
+        if model and model not in ordered:
+            ordered.append(model)
+    return ordered or [DEFAULT_WS_MODEL]
+
+
+def _extract_inline_error_code(text: str) -> str | None:
+    match = re.match(r"^\[Error\]\s+([A-Za-z_]+)\s*:", text.strip())
+    if not match:
+        return None
+    return match.group(1).lower()
+
+
+def _should_try_next_model(error_code: str | None) -> bool:
+    if not error_code:
+        return False
+    return error_code.lower() in {"rate_limited", "resource_exhausted", "unavailable"}
+
+
+def _attach_model_metadata(
+    result: dict[str, Any],
+    model: str,
+    attempted_models: list[str],
+) -> dict[str, Any]:
+    meta = result.setdefault("_meta", {})
+    meta["model"] = model
+    meta["model_attempts"] = attempted_models[:]
+    meta["fallback_used"] = len(attempted_models) > 1
+    return result
+
+
 # ─── 网络层 ────────────────────────────────────────────────
 
 def _unary_request(url: str, proto_bytes: bytes, compress: bool = True) -> bytes:
@@ -1178,10 +1224,10 @@ def fetch_jwt(api_key: str) -> str:
     raise RuntimeError("无法从 GetUserJwt 响应中提取 JWT")
 
 
-def check_rate_limit(api_key: str, jwt: str) -> bool:
+def check_rate_limit(api_key: str, jwt: str, model: str) -> bool:
     req = ProtobufEncoder()
     req.write_message(1, _build_metadata(api_key, jwt))
-    req.write_string(3, WS_MODEL)
+    req.write_string(3, model)
     try:
         _unary_request(f"{API_BASE}/CheckUserMessageRateLimit", req.to_bytes(), compress=True)
         return True
@@ -1252,7 +1298,13 @@ def _build_chat_message(role: int, content: str, *,
     return msg
 
 
-def _build_request(api_key: str, jwt: str, messages: list[dict], tool_defs: str) -> bytes:
+def _build_request(
+    api_key: str,
+    jwt: str,
+    messages: list[dict],
+    tool_defs: str,
+    model: str,
+) -> bytes:
     req = ProtobufEncoder()
     req.write_message(1, _build_metadata(api_key, jwt))
     for m in messages:
@@ -1264,7 +1316,8 @@ def _build_request(api_key: str, jwt: str, messages: list[dict], tool_defs: str)
             ref_call_id=m.get("ref_call_id"),
         )
         req.write_message(2, msg_enc)
-    req.write_string(3, tool_defs)
+    req.write_string(3, model)
+    req.write_string(4, tool_defs)
     return req.to_bytes()
 
 
@@ -1383,6 +1436,129 @@ def get_repo_map(
     return tree, 0, len(tree.encode("utf-8")), True
 
 
+def _search_once(
+    query: str,
+    project_root: str,
+    api_key: str,
+    jwt: str,
+    model: str,
+    system_prompt: str,
+    tool_defs: str,
+    user_content: str,
+    max_turns: int,
+    timeout_ms: int,
+    actual_depth: int,
+    tree_size_bytes: int,
+    fell_back: bool,
+    on_progress: Callable[[str], None] | None = None,
+) -> Dict[str, Any]:
+    def log(msg: str) -> None:
+        if on_progress:
+            on_progress(msg)
+
+    def build_meta(**extra: Any) -> dict[str, Any]:
+        meta = {
+            "tree_depth": actual_depth,
+            "tree_size_kb": round(tree_size_bytes / 1024, 1),
+            "fell_back": fell_back,
+            "project_root": project_root,
+            "model": model,
+        }
+        meta.update(extra)
+        return meta
+
+    executor = ToolExecutor(project_root)
+    messages: list[dict] = [
+        {"role": 5, "content": system_prompt},
+        {"role": 1, "content": user_content},
+    ]
+
+    total_api_calls = max_turns + 1
+
+    for turn in range(total_api_calls):
+        log(f"{model}: 轮次 {turn + 1}/{total_api_calls}")
+
+        proto = _build_request(api_key, jwt, messages, tool_defs, model)
+        try:
+            resp_data = _streaming_request(proto, timeout_ms=timeout_ms)
+        except Exception as exc:
+            err = _classify_error(exc)
+            if err.code in {"PAYLOAD_TOO_LARGE", "TIMEOUT"} and len(messages) > 4:
+                log(f"{model}: {err.code}，裁剪上下文后重试")
+                _trim_messages(messages)
+                retry_proto = _build_request(api_key, jwt, messages, tool_defs, model)
+                try:
+                    resp_data = _streaming_request(retry_proto, timeout_ms=timeout_ms)
+                except Exception as retry_exc:
+                    retry_err = _classify_error(retry_exc)
+                    return {
+                        "files": [],
+                        "error": f"{retry_err.code}: {retry_err}",
+                        "_meta": build_meta(
+                            context_trimmed=True,
+                            error_code=retry_err.code,
+                        ),
+                    }
+            else:
+                return {
+                    "files": [],
+                    "error": f"{err.code}: {err}",
+                    "_meta": build_meta(error_code=err.code),
+                }
+
+        thinking, tool_info = _parse_response(resp_data)
+
+        if tool_info is None:
+            if thinking.startswith("[Error]"):
+                return {
+                    "files": [],
+                    "error": thinking,
+                    "_meta": build_meta(error_code=_extract_inline_error_code(thinking)),
+                }
+            return {
+                "files": [],
+                "raw_response": thinking,
+                "_meta": build_meta(),
+            }
+
+        tool_name, tool_args = tool_info
+
+        if tool_name == "answer":
+            answer_xml = tool_args.get("answer", "")
+            log(f"{model}: 收到最终答案")
+            result = _parse_answer(answer_xml, project_root)
+            result["rg_patterns"] = list(dict.fromkeys(executor.collected_rg_patterns))
+            result["_meta"] = build_meta()
+            return result
+
+        if tool_name == "restricted_exec":
+            call_id = str(uuid.uuid4())
+            args_json = json.dumps(tool_args, ensure_ascii=False)
+
+            cmds = [k for k in tool_args if k.startswith("command")]
+            log(f"{model}: 执行 {len(cmds)} 个本地命令")
+
+            results = executor.exec_tool_call_async(tool_args)
+
+            messages.append({
+                "role": 2, "content": thinking,
+                "tool_call_id": call_id, "tool_name": "restricted_exec",
+                "tool_args_json": args_json,
+            })
+            messages.append({"role": 4, "content": results, "ref_call_id": call_id})
+
+            if turn >= max_turns - 1:
+                messages.append({"role": 1, "content": FINAL_FORCE_ANSWER})
+                log(f"{model}: 注入强制回答提示")
+
+    return {
+        "files": [],
+        "error": "达到最大轮次仍未获得答案",
+        "rg_patterns": list(dict.fromkeys(executor.collected_rg_patterns)),
+        "_meta": build_meta(),
+    }
+
+
 def search(
     query: str,
     project_root: str,
@@ -1422,19 +1598,12 @@ def search(
     project_root = os.path.abspath(project_root)
     exclude_paths = exclude_paths or []
 
-    # 获取凭证
     if not api_key:
         api_key = get_api_key()
     if not jwt:
         log("获取 JWT...")
         jwt = fetch_jwt(api_key)
 
-    # 检查限流
-    log("检查限流...")
-    if not check_rate_limit(api_key, jwt):
-        return {"files": [], "error": "触发限流，请稍后再试"}
-
-    executor = ToolExecutor(project_root)
     tool_defs = get_tool_definitions(max_commands)
     system_prompt = build_system_prompt(max_turns, max_commands, max_results)
 
@@ -1459,120 +1628,70 @@ def search(
         f"Repo Map (tree -L {actual_depth} /codebase):\n```text\n{repo_map}\n```",
     ]).strip()
 
-    messages: list[dict] = [
-        {"role": 5, "content": system_prompt},
-        {"role": 1, "content": user_content},
-    ]
+    model_candidates = _resolve_model_candidates()
+    last_result: Dict[str, Any] | None = None
 
-    # 总 API 调用 = max_turns + 1（最后一轮 answer）
-    total_api_calls = max_turns + 1
-
-    for turn in range(total_api_calls):
-        log(f"轮次 {turn + 1}/{total_api_calls}")
-
-        proto = _build_request(api_key, jwt, messages, tool_defs)
-        try:
-            resp_data = _streaming_request(proto, timeout_ms=timeout_ms)
-        except Exception as exc:
-            err = _classify_error(exc)
-            if err.code in {"PAYLOAD_TOO_LARGE", "TIMEOUT"} and len(messages) > 4:
-                log(f"{err.code}，裁剪上下文后重试")
-                _trim_messages(messages)
-                retry_proto = _build_request(api_key, jwt, messages, tool_defs)
-                try:
-                    resp_data = _streaming_request(retry_proto, timeout_ms=timeout_ms)
-                except Exception as retry_exc:
-                    retry_err = _classify_error(retry_exc)
-                    return {
-                        "files": [],
-                        "error": f"{retry_err.code}: {retry_err}",
-                        "_meta": {
-                            "tree_depth": actual_depth,
-                            "tree_size_kb": round(tree_size_bytes / 1024, 1),
-                            "fell_back": fell_back,
-                            "context_trimmed": True,
-                            "error_code": retry_err.code,
-                            "project_root": project_root,
-                        },
-                    }
-            else:
-                return {
-                    "files": [],
-                    "error": f"{err.code}: {err}",
-                    "_meta": {
-                        "tree_depth": actual_depth,
-                        "tree_size_kb": round(tree_size_bytes / 1024, 1),
-                        "fell_back": fell_back,
-                        "error_code": err.code,
-                        "project_root": project_root,
-                    },
-                }
-
-        thinking, tool_info = _parse_response(resp_data)
-
-        if tool_info is None:
-            if thinking.startswith("[Error]"):
-                return {
-                    "files": [],
-                    "error": thinking,
-                    "_meta": {
-                        "tree_depth": actual_depth,
-                        "tree_size_kb": round(tree_size_bytes / 1024, 1),
-                        "fell_back": fell_back,
-                        "project_root": project_root,
-                    },
-                }
-            return {
+    for index, model in enumerate(model_candidates, 1):
+        log(f"检查模型 {model} ({index}/{len(model_candidates)})")
+        if not check_rate_limit(api_key, jwt, model):
+            limited_result = {
                 "files": [],
-                "raw_response": thinking,
+                "error": "触发限流，请稍后再试",
                 "_meta": {
                     "tree_depth": actual_depth,
                     "tree_size_kb": round(tree_size_bytes / 1024, 1),
                     "fell_back": fell_back,
                     "project_root": project_root,
+                    "error_code": "RATE_LIMITED",
                 },
             }
+            last_result = _attach_model_metadata(
+                limited_result,
+                model=model,
+                attempted_models=model_candidates[:index],
+            )
+            if index < len(model_candidates):
+                log(f"{model} 被限流，切换到备用模型")
+                continue
+            return last_result
 
-        tool_name, tool_args = tool_info
+        result = _search_once(
+            query=query,
+            project_root=project_root,
+            api_key=api_key,
+            jwt=jwt,
+            model=model,
+            system_prompt=system_prompt,
+            tool_defs=tool_defs,
+            user_content=user_content,
+            max_turns=max_turns,
+            timeout_ms=timeout_ms,
+            actual_depth=actual_depth,
+            tree_size_bytes=tree_size_bytes,
+            fell_back=fell_back,
+            on_progress=on_progress,
+        )
+        result = _attach_model_metadata(
+            result,
+            model=model,
+            attempted_models=model_candidates[:index],
+        )
+        last_result = result
 
-        if tool_name == "answer":
-            answer_xml = tool_args.get("answer", "")
-            log("收到最终答案")
-            result = _parse_answer(answer_xml, project_root)
-            result["rg_patterns"] = list(dict.fromkeys(executor.collected_rg_patterns))
-            result["_meta"] = {
-                "tree_depth": actual_depth,
-                "tree_size_kb": round(tree_size_bytes / 1024, 1),
-                "fell_back": fell_back,
-                "project_root": project_root,
-            }
-            return result
+        error_code = None
+        if result.get("error"):
+            meta = result.get("_meta") or {}
+            error_code = meta.get("error_code") or _extract_inline_error_code(result["error"])
 
-        if tool_name == "restricted_exec":
-            call_id = str(uuid.uuid4())
-            args_json = json.dumps(tool_args, ensure_ascii=False)
+        if result.get("error") and _should_try_next_model(error_code) and index < len(model_candidates):
+            log(f"{model} 返回 {error_code}，切换到备用模型")
+            continue
 
-            cmds = [k for k in tool_args if k.startswith("command")]
-            log(f"执行 {len(cmds)} 个本地命令")
+        return result
 
-            results = executor.exec_tool_call_async(tool_args)
-
-            messages.append({
-                "role": 2, "content": thinking,
-                "tool_call_id": call_id, "tool_name": "restricted_exec",
-                "tool_args_json": args_json,
-            })
-            messages.append({"role": 4, "content": results, "ref_call_id": call_id})
-
-            # 最后一轮搜索后注入强制回答
-            if turn >= max_turns - 1:
-                messages.append({"role": 1, "content": FINAL_FORCE_ANSWER})
-                log("注入强制回答提示")
-
-    return {
+    return last_result or {
         "files": [],
-        "error": "达到最大轮次仍未获得答案",
-        "rg_patterns": list(dict.fromkeys(executor.collected_rg_patterns)),
+        "error": "没有可用的模型候选",
         "_meta": {
             "tree_depth": actual_depth,
             "tree_size_kb": round(tree_size_bytes / 1024, 1),
@@ -1812,6 +1931,11 @@ def _format_success_output(
             f"max_turns={max_turns}, max_results={max_results}, "
             f"max_commands={max_commands}, timeout_ms={timeout_ms}"
         )
+        if meta.get("model"):
+            config_line += f", model={meta['model']}"
+        attempts = meta.get("model_attempts") or []
+        if len(attempts) > 1:
+            config_line += f", model_attempts={' -> '.join(attempts)}"
         if meta.get("fell_back"):
             config_line += " (fell back from requested depth)"
         if exclude_paths:
@@ -1855,6 +1979,11 @@ def search_with_content(
                 f"\n\n[diagnostic] tree_depth={meta.get('tree_depth')}, "
                 f"tree_size={meta.get('tree_size_kb')}KB"
             )
+            if meta.get("model"):
+                message += f", model={meta['model']}"
+            attempts = meta.get("model_attempts") or []
+            if len(attempts) > 1:
+                message += f", model_attempts={' -> '.join(attempts)}"
             if meta.get("fell_back"):
                 message += " (auto fell back)"
             if meta.get("context_trimmed"):
@@ -1869,6 +1998,8 @@ def search_with_content(
             message += "\n[hint] Windsurf 凭证可能已过期，重新提取后设置 WINDSURF_API_KEY 再试。"
         elif "PAYLOAD_TOO_LARGE" in result["error"] or "TIMEOUT" in result["error"]:
             message += "\n[hint] 尝试降低 tree_depth、缩小 project_root，或增加 exclude_paths。"
+        elif "resource_exhausted" in result["error"].lower():
+            message += "\n[hint] 已自动尝试备用模型；如果仍失败，可稍后重试或设置 WS_FALLBACK_MODELS 扩展候选链。"
         return message
 
     files = result.get("files", [])

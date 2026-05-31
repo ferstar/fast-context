@@ -111,6 +111,7 @@ Current Windsurf installs may store either classic API keys or session-style cre
 
 - `WINDSURF_API_KEY`: explicit credential override
 - `WS_MODEL`: optional model override. Default is `MODEL_SWE_1_6_FAST`
+- `WS_FALLBACK_MODELS`: optional comma-separated fallback chain. Default is `MODEL_SWE_1_5`
 - `WS_APP_VER`
 - `WS_LS_VER`
 
@@ -119,7 +120,8 @@ Current Windsurf installs may store either classic API keys or session-style cre
 Local testing on `2026-05-31` suggests these practical defaults:
 
 - `MODEL_SWE_1_6_FAST` is the best default for individual day-to-day coding use and one-off repo lookups.
-- If Windsurf starts returning repeated `resource_exhausted`, switch to `MODEL_SWE_1_5` first. It was the most stable fallback in local testing.
+- This repo now automatically falls back to `MODEL_SWE_1_5` when the primary model hits `resource_exhausted` or model-specific rate limiting.
+- If you want a different fallback order, set `WS_FALLBACK_MODELS`, for example `WS_FALLBACK_MODELS=MODEL_SWE_1_5,MODEL_SWE_1_6`.
 - `MODEL_SWE_1_7_FAST` is currently not recommended.
 
 These results are empirical rather than guaranteed. Upstream capacity variance can affect both latency and success rate.

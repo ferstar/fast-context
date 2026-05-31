@@ -26,10 +26,10 @@ Use the bundled Python CLI to get a small set of high-signal candidate files. Th
 ## Workflow
 
 1. Pick the narrowest project root that still contains the relevant code.
-2. Run:
+2. Run through `uv` so the skill uses its locked dependencies and Python 3.10-3.13 environment:
 
 ```bash
-python "$SKILL_DIR/src/fast_context_cli.py" search \
+uv run --project "$SKILL_DIR" fast-context search \
   --query "<natural language query>" \
   --project "<repo-root>"
 ```
@@ -37,7 +37,7 @@ python "$SKILL_DIR/src/fast_context_cli.py" search \
 3. If you need faster warm-cache chunk retrieval in the same repo, run:
 
 ```bash
-python "$SKILL_DIR/src/fast_context_cli.py" local-search \
+uv run --project "$SKILL_DIR" fast-context local-search \
   --query "<natural language query>" \
   --project "<repo-root>"
 ```
@@ -45,7 +45,7 @@ python "$SKILL_DIR/src/fast_context_cli.py" local-search \
 4. If a local chunk looks promising and you want related code, run:
 
 ```bash
-python "$SKILL_DIR/src/fast_context_cli.py" find-related \
+uv run --project "$SKILL_DIR" fast-context find-related \
   --file "<repo-relative-file>" \
   --line <line> \
   --project "<repo-root>"
@@ -69,7 +69,7 @@ python "$SKILL_DIR/src/fast_context_cli.py" find-related \
 Example:
 
 ```bash
-python "$SKILL_DIR/src/fast_context_cli.py" search \
+uv run --project "$SKILL_DIR" fast-context search \
   --query "where is the browser login handoff state validated" \
   --project "/workspace/repo" \
   --tree-depth 4 \
@@ -86,7 +86,7 @@ python "$SKILL_DIR/src/fast_context_cli.py" search \
 - If Windsurf lives on another host, copy the database locally and run:
 
 ```bash
-python "$SKILL_DIR/src/fast_context_cli.py" extract-key --db-path "<copied-state.vscdb>"
+uv run --project "$SKILL_DIR" fast-context extract-key --db-path "<copied-state.vscdb>"
 ```
 
 ## Output expectations

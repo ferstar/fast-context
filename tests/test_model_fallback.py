@@ -22,12 +22,14 @@ class ModelFallbackTest(unittest.TestCase):
 
     @patch("core._search_once")
     @patch("core.check_rate_limit")
+    @patch("core.time.sleep")
     @patch("core.build_local_anchor_brief")
     @patch("core.get_repo_map")
     def test_search_falls_back_after_resource_exhausted(
         self,
         mock_repo_map,
         mock_anchor_brief,
+        mock_sleep,
         mock_check_rate_limit,
         mock_search_once,
     ) -> None:
@@ -65,6 +67,7 @@ class ModelFallbackTest(unittest.TestCase):
             {
                 "WS_MODEL": "MODEL_SWE_1_6_FAST",
                 "WS_FALLBACK_MODELS": "MODEL_SWE_1_5",
+                "WS_MAX_RETRIES": "0",
             },
             clear=False,
         ):
@@ -92,21 +95,24 @@ class ModelFallbackTest(unittest.TestCase):
             mock_check_rate_limit.call_args_list[1].args,
             ("token", "jwt", "MODEL_SWE_1_5"),
         )
+        mock_sleep.assert_not_called()
 
     @patch("core._search_once")
     @patch("core.check_rate_limit")
+    @patch("core.time.sleep")
     @patch("core.build_local_anchor_brief")
     @patch("core.get_repo_map")
     def test_search_skips_rate_limited_primary_model(
         self,
         mock_repo_map,
         mock_anchor_brief,
+        mock_sleep,
         mock_check_rate_limit,
         mock_search_once,
     ) -> None:
         mock_repo_map.return_value = ("/codebase\n├── src", 3, 512, False)
         mock_anchor_brief.return_value = ""
-        mock_check_rate_limit.side_effect = [False, True]
+        mock_check_rate_limit.side_effect = [False, False, True]
         mock_search_once.return_value = {
             "files": [],
             "raw_response": "<ANSWER></ANSWER>",
@@ -124,6 +130,7 @@ class ModelFallbackTest(unittest.TestCase):
             {
                 "WS_MODEL": "MODEL_SWE_1_6_FAST",
                 "WS_FALLBACK_MODELS": "MODEL_SWE_1_5",
+                "WS_MAX_RETRIES": "1",
             },
             clear=False,
         ):
@@ -140,8 +147,77 @@ class ModelFallbackTest(unittest.TestCase):
             ["MODEL_SWE_1_6_FAST", "MODEL_SWE_1_5"],
         )
         self.assertTrue(result["_meta"]["fallback_used"])
+        self.assertEqual(result["_meta"]["model_retry_count"], 0)
         self.assertEqual(mock_search_once.call_count, 1)
         self.assertEqual(mock_search_once.call_args.kwargs["model"], "MODEL_SWE_1_5")
+        mock_sleep.assert_called_once()
+
+    @patch("core._search_once")
+    @patch("core.check_rate_limit")
+    @patch("core.time.sleep")
+    @patch("core.build_local_anchor_brief")
+    @patch("core.get_repo_map")
+    def test_search_retries_same_model_before_success(
+        self,
+        mock_repo_map,
+        mock_anchor_brief,
+        mock_sleep,
+        mock_check_rate_limit,
+        mock_search_once,
+    ) -> None:
+        mock_repo_map.return_value = ("/codebase\n├── src", 3, 512, False)
+        mock_anchor_brief.return_value = ""
+        mock_check_rate_limit.side_effect = [True, True]
+        mock_search_once.side_effect = [
+            {
+                "files": [],
+                "error": "[Error] resource_exhausted: backend overloaded",
+                "_meta": {
+                    "tree_depth": 3,
+                    "tree_size_kb": 0.5,
+                    "fell_back": False,
+                    "project_root": self.project_root,
+                    "model": "MODEL_SWE_1_6_FAST",
+                    "error_code": "resource_exhausted",
+                },
+            },
+            {
+                "files": [],
+                "raw_response": "<ANSWER></ANSWER>",
+                "_meta": {
+                    "tree_depth": 3,
+                    "tree_size_kb": 0.5,
+                    "fell_back": False,
+                    "project_root": self.project_root,
+                    "model": "MODEL_SWE_1_6_FAST",
+                },
+            },
+        ]
+
+        with patch.dict(
+            os.environ,
+            {
+                "WS_MODEL": "MODEL_SWE_1_6_FAST",
+                "WS_FALLBACK_MODELS": "",
+                "WS_MAX_RETRIES": "1",
+                "WS_RETRY_BASE_MS": "1",
+                "WS_RETRY_MAX_MS": "1",
+            },
+            clear=False,
+        ):
+            result = core.search(
+                query="where is auth checked",
+                project_root=self.project_root,
+                api_key="token",
+                jwt="jwt",
+            )
+
+        self.assertEqual(result["_meta"]["model"], "MODEL_SWE_1_6_FAST")
+        self.assertEqual(result["_meta"]["model_attempts"], ["MODEL_SWE_1_6_FAST"])
+        self.assertFalse(result["_meta"]["fallback_used"])
+        self.assertEqual(result["_meta"]["model_retry_count"], 1)
+        self.assertEqual(mock_search_once.call_count, 2)
+        mock_sleep.assert_called_once()
 
 
 if __name__ == "__main__":

@@ -18,6 +18,7 @@ import json
 import multiprocessing
 import os
 import platform
+import random
 import re
 import sqlite3
 import struct
@@ -567,6 +568,9 @@ AUTH_BASE = "https://server.self-serve.windsurf.com/exa.auth_pb.AuthService"
 WS_APP = "windsurf"
 DEFAULT_WS_MODEL = "MODEL_SWE_1_6_FAST"
 DEFAULT_WS_FALLBACK_MODELS = ("MODEL_SWE_1_5",)
+DEFAULT_WS_RETRY_BASE_MS = 1000
+DEFAULT_WS_RETRY_MAX_MS = 5000
+DEFAULT_WS_MAX_RETRIES = 2
 WS_APP_VER = os.environ.get("WS_APP_VER", "1.48.2")
 WS_LS_VER = os.environ.get("WS_LS_VER", "1.9544.35")
 
@@ -1098,6 +1102,17 @@ def _parse_model_env(raw: str) -> list[str]:
     return [part.strip() for part in raw.split(",") if part.strip()]
 
 
+def _env_int(name: str, default: int, minimum: int = 0) -> int:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        return default
+    return max(minimum, value)
+
+
 def _resolve_model_candidates(primary_model: str | None = None) -> list[str]:
     primary = (primary_model or os.environ.get("WS_MODEL", DEFAULT_WS_MODEL)).strip()
     fallback_raw = os.environ.get("WS_FALLBACK_MODELS")
@@ -1127,15 +1142,39 @@ def _should_try_next_model(error_code: str | None) -> bool:
     return error_code.lower() in {"rate_limited", "resource_exhausted", "unavailable"}
 
 
+def _should_retry_same_model(error_code: str | None) -> bool:
+    if not error_code:
+        return False
+    return error_code.lower() in {"rate_limited", "resource_exhausted", "unavailable", "timeout"}
+
+
+def _resolve_retry_config() -> tuple[int, int, int]:
+    base_ms = _env_int("WS_RETRY_BASE_MS", DEFAULT_WS_RETRY_BASE_MS, minimum=0)
+    max_ms = _env_int("WS_RETRY_MAX_MS", DEFAULT_WS_RETRY_MAX_MS, minimum=0)
+    max_retries = _env_int("WS_MAX_RETRIES", DEFAULT_WS_MAX_RETRIES, minimum=0)
+    if max_ms < base_ms:
+        max_ms = base_ms
+    return base_ms, max_ms, max_retries
+
+
+def _sleep_with_backoff(base_ms: int, max_ms: int, attempt: int) -> float:
+    cap_ms = min(max_ms, base_ms * (2 ** attempt))
+    delay_ms = random.uniform(base_ms, cap_ms)
+    time.sleep(delay_ms / 1000.0)
+    return delay_ms
+
+
 def _attach_model_metadata(
     result: dict[str, Any],
     model: str,
     attempted_models: list[str],
+    model_retry_count: int = 0,
 ) -> dict[str, Any]:
     meta = result.setdefault("_meta", {})
     meta["model"] = model
     meta["model_attempts"] = attempted_models[:]
     meta["fallback_used"] = len(attempted_models) > 1
+    meta["model_retry_count"] = model_retry_count
     return result
 
 
@@ -1634,65 +1673,76 @@ def search(
     ]).strip()
 
     model_candidates = _resolve_model_candidates()
+    retry_base_ms, retry_max_ms, max_model_retries = _resolve_retry_config()
     last_result: Dict[str, Any] | None = None
 
     for index, model in enumerate(model_candidates, 1):
-        log(f"检查模型 {model} ({index}/{len(model_candidates)})")
-        if not check_rate_limit(api_key, jwt, model):
-            limited_result = {
-                "files": [],
-                "error": "触发限流，请稍后再试",
-                "_meta": {
-                    "tree_depth": actual_depth,
-                    "tree_size_kb": round(tree_size_bytes / 1024, 1),
-                    "fell_back": fell_back,
-                    "project_root": project_root,
-                    "error_code": "RATE_LIMITED",
-                },
-            }
-            last_result = _attach_model_metadata(
-                limited_result,
+        for retry_count in range(max_model_retries + 1):
+            if retry_count:
+                log(f"检查模型 {model} ({index}/{len(model_candidates)})，重试 {retry_count}/{max_model_retries}")
+            else:
+                log(f"检查模型 {model} ({index}/{len(model_candidates)})")
+
+            if not check_rate_limit(api_key, jwt, model):
+                result = {
+                    "files": [],
+                    "error": "触发限流，请稍后再试",
+                    "_meta": {
+                        "tree_depth": actual_depth,
+                        "tree_size_kb": round(tree_size_bytes / 1024, 1),
+                        "fell_back": fell_back,
+                        "project_root": project_root,
+                        "error_code": "RATE_LIMITED",
+                    },
+                }
+            else:
+                result = _search_once(
+                    query=query,
+                    project_root=project_root,
+                    api_key=api_key,
+                    jwt=jwt,
+                    model=model,
+                    system_prompt=system_prompt,
+                    tool_defs=tool_defs,
+                    user_content=user_content,
+                    max_turns=max_turns,
+                    timeout_ms=timeout_ms,
+                    actual_depth=actual_depth,
+                    tree_size_bytes=tree_size_bytes,
+                    fell_back=fell_back,
+                    on_progress=on_progress,
+                )
+
+            result = _attach_model_metadata(
+                result,
                 model=model,
                 attempted_models=model_candidates[:index],
+                model_retry_count=retry_count,
             )
-            if index < len(model_candidates):
-                log(f"{model} 被限流，切换到备用模型")
+            last_result = result
+
+            error_code = None
+            if result.get("error"):
+                meta = result.get("_meta") or {}
+                error_code = meta.get("error_code") or _extract_inline_error_code(result["error"])
+
+            if not result.get("error"):
+                return result
+
+            if _should_retry_same_model(error_code) and retry_count < max_model_retries:
+                delay_ms = _sleep_with_backoff(retry_base_ms, retry_max_ms, retry_count + 1)
+                label = error_code or "unknown"
+                log(
+                    f"{model} 返回 {label}，{delay_ms / 1000:.1f}s 后重试同模型 "
+                    f"({retry_count + 1}/{max_model_retries})"
+                )
                 continue
-            return last_result
 
-        result = _search_once(
-            query=query,
-            project_root=project_root,
-            api_key=api_key,
-            jwt=jwt,
-            model=model,
-            system_prompt=system_prompt,
-            tool_defs=tool_defs,
-            user_content=user_content,
-            max_turns=max_turns,
-            timeout_ms=timeout_ms,
-            actual_depth=actual_depth,
-            tree_size_bytes=tree_size_bytes,
-            fell_back=fell_back,
-            on_progress=on_progress,
-        )
-        result = _attach_model_metadata(
-            result,
-            model=model,
-            attempted_models=model_candidates[:index],
-        )
-        last_result = result
+            if _should_try_next_model(error_code) and index < len(model_candidates):
+                log(f"{model} 返回 {error_code}，切换到备用模型")
+                break
 
-        error_code = None
-        if result.get("error"):
-            meta = result.get("_meta") or {}
-            error_code = meta.get("error_code") or _extract_inline_error_code(result["error"])
-
-        if result.get("error") and _should_try_next_model(error_code) and index < len(model_candidates):
-            log(f"{model} 返回 {error_code}，切换到备用模型")
-            continue
-
-        return result
+            return result
 
     return last_result or {
         "files": [],

@@ -34,28 +34,35 @@ fast-context/
 │   └── fast_context_cli.py   # CLI entrypoint for the skill
 ├── SKILL.md              # Skill instructions
 ├── pyproject.toml
-└── evals/evals.json
+└── uv.lock
 ```
 
 ## Requirements
 
-- Python 3.10+
+- Python 3.10 through 3.13 (`>=3.10,<3.14`)
+- `uv`
 - A Windsurf login on the same machine, or `WINDSURF_API_KEY`
-- Semble for local chunk search. `pip install -e .` installs it; direct skill usage can also fall back to `uvx --from semble`.
+- Semble for local chunk search. `uv sync` installs it; direct skill usage can also fall back to `uvx --from semble`.
 - `rg` is optional but recommended. Python fallback search is built in.
 
 ## Install
 
-Editable install:
+Install dependencies into the project environment:
 
 ```bash
-pip install -e .
+uv sync
 ```
 
-Direct use without install also works:
+Run the CLI through uv:
 
 ```bash
-python src/fast_context_cli.py --help
+uv run fast-context --help
+```
+
+Refresh the lockfile after dependency or Python-version changes:
+
+```bash
+uv lock --default-index https://pypi.org/simple
 ```
 
 ## CLI
@@ -63,7 +70,7 @@ python src/fast_context_cli.py --help
 ### Search
 
 ```bash
-python src/fast_context_cli.py search \
+uv run fast-context search \
   --query "where is the desktop browser login handoff state validated" \
   --project .
 ```
@@ -104,7 +111,7 @@ applyExternalSession, createAuthHandoff, handoff.*state
 Run cached local chunk retrieval directly:
 
 ```bash
-python src/fast_context_cli.py local-search \
+uv run fast-context local-search \
   --query "how semantic and lexical scores are fused" \
   --project .
 ```
@@ -112,7 +119,7 @@ python src/fast_context_cli.py local-search \
 Search documentation or config:
 
 ```bash
-python src/fast_context_cli.py local-search \
+uv run fast-context local-search \
   --query "deployment guide" \
   --project . \
   --content docs
@@ -121,7 +128,7 @@ python src/fast_context_cli.py local-search \
 Find chunks related to a prior result:
 
 ```bash
-python src/fast_context_cli.py find-related \
+uv run fast-context find-related \
   --file src/search.py \
   --line 77 \
   --project .
@@ -132,13 +139,13 @@ python src/fast_context_cli.py find-related \
 Local install:
 
 ```bash
-python src/fast_context_cli.py extract-key
+uv run fast-context extract-key
 ```
 
 Copied database file:
 
 ```bash
-python src/fast_context_cli.py extract-key --db-path /tmp/state.vscdb
+uv run fast-context extract-key --db-path /tmp/state.vscdb
 ```
 
 Current Windsurf installs may store either classic API keys or session-style credentials such as `devin-session-token$...`. This repo accepts either form as long as Windsurf accepts it.
@@ -164,6 +171,31 @@ Local testing on `2026-05-31` suggests these practical defaults:
 - `MODEL_SWE_1_7_FAST` is currently not recommended.
 
 These results are empirical rather than guaranteed. Upstream capacity variance can affect both latency and success rate.
+
+## Retrieval benchmark
+
+Local testing on `2026-05-31` reused Semble's benchmark protocol: pinned repos, annotation JSON as ground truth, and NDCG/recall metrics from `benchmarks/metrics.py`. To keep remote Windsurf usage practical, the run sampled 12 queries from two synced Semble benchmark repos (`fastapi` and `axios`), with 2 queries per category (`architecture`, `semantic`, `symbol`) per repo.
+
+Command settings:
+
+- `max_results=10`
+- `max_turns=2`
+- `timeout_ms=30000`
+- backends compared: `local`, `remote`, `hybrid`
+
+| Backend | NDCG@10 | Recall@10 | Top-1 | MRR | p50 latency | Remote/degradation errors |
+|---|---:|---:|---:|---:|---:|---:|
+| `local` | 0.865 | 1.000 | 0.833 | 0.903 | 197 ms | 0 |
+| `remote` | 0.630 | 0.667 | 0.667 | 0.667 | 4.87 s | 4 |
+| `hybrid` | 0.895 | 1.000 | 0.833 | 0.917 | 4.05 s | 8 |
+
+Interpretation:
+
+- `local` is the fastest path and already has strong recall once the Semble cache is warm.
+- `remote` is strong when upstream succeeds, but its end-to-end result is sensitive to auth, rate limit, and transient backend failures.
+- `hybrid` was the best default in this run: Semble chunk prefetch preserved recall, while Windsurf verification/expansion improved ranking quality. When remote degraded, local chunks still kept the output usable.
+
+This is a small operational benchmark, not a statistically complete replacement for Semble's full 1,251-query benchmark suite. It is intended to validate the fast-context integration shape and default backend choice.
 
 ## Skill usage
 

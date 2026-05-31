@@ -13,7 +13,6 @@ venv/
 *.egg-info/
 dist/
 build/
-uv.lock
 test_*.py
 !tests/test_output_format.py
 !tests/test_model_fallback.py

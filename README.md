@@ -23,6 +23,24 @@ The high-ROI path for code search is not prompt tricks. It is a hybrid retrieval
 
 This repo implements the local side in Python so it is easy to run in a skill. Semble is used as the high-ROI local index backend for warm, cached chunk retrieval, while Windsurf remains responsible for agentic verification and call-chain expansion.
 
+## Hybrid pipeline
+
+```text
+User query
+  -> Semble local prefetch
+     -> cached index + potion-code-16M chunks
+  -> fast-context prompt
+     -> original query + Semble chunk hints + lexical anchors + repo map
+  -> Windsurf remote search
+     -> verify hints with rg/readfile/tree/ls/glob and expand related files
+  -> Start here output
+     -> files, line ranges, follow-up search terms, local chunk candidates
+
+Remote failure path:
+  Windsurf auth/rate-limit/timeout/resource_exhausted
+    -> return local Semble chunk results instead of an empty failure
+```
+
 ## Files
 
 ```text

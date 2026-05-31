@@ -1996,7 +1996,11 @@ def _format_semble_output(
     meta = payload.get("_meta") or {}
     if verbose and meta:
         runner = meta.get("runner", "unknown")
-        parts.append(f"[local] backend=semble, runner={runner}")
+        cache_status = meta.get("cache")
+        detail = f"[local] backend=semble, runner={runner}"
+        if cache_status:
+            detail += f", cache={cache_status}"
+        parts.append(detail)
 
     while parts and not parts[-1]:
         parts.pop()
@@ -2050,12 +2054,15 @@ def local_search_with_content(
     content_types: list[str] | None = None,
     verbose: bool = False,
 ) -> str:
-    payload = semble_search(
-        query=query,
-        project_root=project_root,
-        top_k=max_results,
-        content=content_types,
-    )
+    try:
+        payload = semble_search(
+            query=query,
+            project_root=project_root,
+            top_k=max_results,
+            content=content_types,
+        )
+    except SembleUnavailable as exc:
+        return f"Error: local Semble unavailable: {exc}"
     return _format_semble_output(payload, project_root, verbose=verbose)
 
 
@@ -2067,13 +2074,16 @@ def find_related_with_content(
     content_types: list[str] | None = None,
     verbose: bool = False,
 ) -> str:
-    payload = semble_find_related(
-        file_path=file_path,
-        line=line,
-        project_root=project_root,
-        top_k=max_results,
-        content=content_types,
-    )
+    try:
+        payload = semble_find_related(
+            file_path=file_path,
+            line=line,
+            project_root=project_root,
+            top_k=max_results,
+            content=content_types,
+        )
+    except SembleUnavailable as exc:
+        return f"Error: local Semble unavailable: {exc}"
     return _format_semble_output(
         payload,
         project_root,

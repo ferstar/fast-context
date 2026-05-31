@@ -8,6 +8,17 @@ from pathlib import Path
 
 from core import find_related_with_content, local_search_with_content, search_with_content
 from extract_key import extract_key
+from local_semble import clear_project_cache, gc_stale_caches
+
+
+def _format_bytes(value: int) -> str:
+    units = ["B", "KB", "MB", "GB"]
+    amount = float(value)
+    for unit in units:
+        if amount < 1024 or unit == units[-1]:
+            return f"{amount:.1f}{unit}" if unit != "B" else f"{int(amount)}B"
+        amount /= 1024
+    return f"{amount:.1f}GB"
 
 
 def _add_local_content_args(parser: argparse.ArgumentParser) -> None:
@@ -73,6 +84,19 @@ def _build_parser() -> argparse.ArgumentParser:
 
     extract_parser = subparsers.add_parser("extract-key", help="Extract Windsurf credential")
     extract_parser.add_argument("--db-path", help="Path to a copied state.vscdb")
+
+    cache_clear_parser = subparsers.add_parser("cache-clear", help="Clear Semble cache for a project")
+    cache_clear_parser.add_argument("--project", default=".", help="Project root directory")
+    cache_clear_parser.add_argument("--dry-run", action="store_true", help="Show what would be removed")
+
+    cache_gc_parser = subparsers.add_parser("cache-gc", help="Remove stale Semble cache entries")
+    cache_gc_parser.add_argument("--dry-run", action="store_true", help="Show what would be removed")
+    cache_gc_parser.add_argument(
+        "--min-age-days",
+        type=float,
+        default=0.0,
+        help="Only remove stale entries at least this old. Default: 0",
+    )
 
     return parser
 
@@ -146,6 +170,36 @@ def run_extract_key(args: argparse.Namespace) -> int:
     return 0
 
 
+def run_cache_clear(args: argparse.Namespace) -> int:
+    result = clear_project_cache(args.project, dry_run=args.dry_run)
+    action = "Would remove" if args.dry_run else "Removed"
+    if not result["existed"]:
+        print(f"No Semble cache found for {result['project_root']}")
+        print(f"Cache path: {result['cache_path']}")
+        return 0
+
+    print(f"{action} Semble cache for {result['project_root']}")
+    print(f"Cache path: {result['cache_path']}")
+    print(f"Size: {_format_bytes(result['bytes'])}")
+    return 0
+
+
+def run_cache_gc(args: argparse.Namespace) -> int:
+    result = gc_stale_caches(dry_run=args.dry_run, min_age_days=args.min_age_days)
+    action = "Would remove" if args.dry_run else "Removed"
+    print(
+        f"{action} {result['removed_count']} stale Semble cache entr"
+        f"{'y' if result['removed_count'] == 1 else 'ies'} "
+        f"({_format_bytes(result['removed_bytes'])})"
+    )
+    print(f"Cache root: {result['cache_root']}")
+    for entry in result["entries"]:
+        root = entry["root_path"] or "<unknown>"
+        print(f"- {entry['reason']}: {entry['cache_path']} ({_format_bytes(entry['bytes'])})")
+        print(f"  root: {root}")
+    return 0
+
+
 def main() -> int:
     parser = _build_parser()
     args = parser.parse_args()
@@ -158,6 +212,10 @@ def main() -> int:
         return run_find_related(args)
     if args.command == "extract-key":
         return run_extract_key(args)
+    if args.command == "cache-clear":
+        return run_cache_clear(args)
+    if args.command == "cache-gc":
+        return run_cache_gc(args)
 
     parser.error(f"Unknown command: {args.command}")
     return 2

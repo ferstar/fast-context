@@ -65,6 +65,7 @@ uv run --project "$SKILL_DIR" fast-context find-related \
 - Raise `--max-turns` only when the first pass is clearly incomplete.
 - Keep `--max-results` small unless the user asked for broader exploration.
 - Use `--content docs`, `--content config`, or `--content all` for local Semble searches beyond code.
+- If Semble cache grows after repo moves or temp-project searches, run `cache-gc`; use `cache-clear --project <repo-root>` to reset one project.
 
 Example:
 
@@ -87,6 +88,13 @@ uv run --project "$SKILL_DIR" fast-context search \
 
 ```bash
 uv run --project "$SKILL_DIR" fast-context extract-key --db-path "<copied-state.vscdb>"
+```
+
+## Cache maintenance
+
+```bash
+uv run --project "$SKILL_DIR" fast-context cache-gc
+uv run --project "$SKILL_DIR" fast-context cache-clear --project "<repo-root>"
 ```
 
 ## Output expectations

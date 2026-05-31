@@ -48,7 +48,7 @@ fast-context/
 ├── src/
 │   ├── core.py               # Protocol, search loop, repo map, local lexical anchors
 │   ├── extract_key.py        # Windsurf credential extraction from state.vscdb
-│   ├── local_semble.py       # Local Semble adapter and uvx fallback
+│   ├── local_semble.py       # Local Semble adapter
 │   └── fast_context_cli.py   # CLI entrypoint for the skill
 ├── SKILL.md              # Skill instructions
 ├── pyproject.toml
@@ -60,7 +60,7 @@ fast-context/
 - Python 3.10 through 3.13 (`>=3.10,<3.14`)
 - `uv`
 - A Windsurf login on the same machine, or `WINDSURF_API_KEY`
-- Semble for local chunk search. `uv sync` installs it; direct skill usage can also fall back to `uvx --from semble`.
+- Semble for local chunk search. `uv sync` installs it as a normal runtime dependency.
 - `rg` is optional but recommended. Python fallback search is built in.
 
 ## Install
@@ -152,6 +152,26 @@ uv run fast-context find-related \
   --project .
 ```
 
+### Semble cache management
+
+Clear the cache for one project:
+
+```bash
+uv run fast-context cache-clear --project .
+```
+
+Garbage-collect stale Semble cache entries whose indexed `root_path` no longer exists:
+
+```bash
+uv run fast-context cache-gc
+```
+
+Preview without deleting:
+
+```bash
+uv run fast-context cache-gc --dry-run
+```
+
 ### Extract Windsurf credential
 
 Local install:
@@ -175,9 +195,6 @@ Current Windsurf installs may store either classic API keys or session-style cre
 - `WS_FALLBACK_MODELS`: optional comma-separated fallback chain. Default is `MODEL_SWE_1_5`
 - `WS_APP_VER`
 - `WS_LS_VER`
-- `FAST_CONTEXT_SEMBLE_PYTHON`: Python version used by the `uvx --from semble` fallback. Default is `3.13`
-- `FAST_CONTEXT_SEMBLE_TIMEOUT`: timeout in seconds for the `uvx --from semble` fallback. Default is `120`
-- `FAST_CONTEXT_SEMBLE_UVX`: uvx executable path. Default is `uvx`
 
 ## Model choice
 
@@ -232,7 +249,7 @@ Typical flow:
 - Local lexical anchors are generic. They bias toward exact filenames, path segments, and literal content hits from the query.
 - Repo maps shrink automatically when the tree gets too large.
 - If the remote call times out or the payload is too large, the search loop trims old context and retries once.
-- Semble caches local indexes and invalidates them when files change.
+- Fast Context calls the Semble Python library directly, saves fresh local indexes into Semble's cache, and lets Semble invalidate that cache when indexed files change.
 - Semble chunk hits are candidate evidence, not proof. Hybrid mode asks Windsurf to verify them before producing the main `Start here` output.
 - Successful output stays concise by default. Use `--verbose` when you want anchor snippets and config diagnostics.
 

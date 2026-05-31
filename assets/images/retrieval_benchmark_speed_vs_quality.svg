@@ -1,0 +1,50 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="760" height="420" viewBox="0 0 760 420">
+<rect width="100%" height="100%" fill="#ffffff"/>
+<style>
+text { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; }
+.axis { stroke: #555; stroke-width: 1; }
+.grid { stroke: #e5e7eb; stroke-width: 1; }
+.label { fill: #374151; font-size: 12px; }
+.title { fill: #111827; font-size: 18px; font-weight: 700; }
+.subtitle { fill: #6b7280; font-size: 12px; }
+</style>
+<text class="title" x="84" y="28">Fast Context Retrieval Benchmark</text>
+<text class="subtitle" x="84" y="44">Semble benchmark subset: fastapi + axios, all 40 queries, warm local cache, batch p50 latency on log scale</text>
+<line class="grid" x1="84" y1="320.7" x2="700" y2="320.7"/>
+<text class="label" x="72" y="324.7" text-anchor="end">0.5</text>
+<line class="grid" x1="84" y1="266.2" x2="700" y2="266.2"/>
+<text class="label" x="72" y="270.2" text-anchor="end">0.6</text>
+<line class="grid" x1="84" y1="211.6" x2="700" y2="211.6"/>
+<text class="label" x="72" y="215.6" text-anchor="end">0.7</text>
+<line class="grid" x1="84" y1="157.1" x2="700" y2="157.1"/>
+<text class="label" x="72" y="161.1" text-anchor="end">0.8</text>
+<line class="grid" x1="84" y1="102.5" x2="700" y2="102.5"/>
+<text class="label" x="72" y="106.5" text-anchor="end">0.9</text>
+<line class="grid" x1="84" y1="48.0" x2="700" y2="48.0"/>
+<text class="label" x="72" y="52.0" text-anchor="end">1.0</text>
+<line class="grid" x1="84.0" y1="48" x2="84.0" y2="348"/>
+<text class="label" x="84.0" y="372" text-anchor="middle">30 ms</text>
+<line class="grid" x1="254.6" y1="48" x2="254.6" y2="348"/>
+<text class="label" x="254.6" y="372" text-anchor="middle">200 ms</text>
+<line class="grid" x1="399.4" y1="48" x2="399.4" y2="348"/>
+<text class="label" x="399.4" y="372" text-anchor="middle">1.0 s</text>
+<line class="grid" x1="544.1" y1="48" x2="544.1" y2="348"/>
+<text class="label" x="544.1" y="372" text-anchor="middle">5.0 s</text>
+<line class="grid" x1="686.7" y1="48" x2="686.7" y2="348"/>
+<text class="label" x="686.7" y="372" text-anchor="middle">24.4 s</text>
+<line class="grid" x1="700.0" y1="48" x2="700.0" y2="348"/>
+<text class="label" x="700.0" y="372" text-anchor="middle">28.3 s</text>
+<line class="axis" x1="84" y1="348" x2="700" y2="348"/>
+<line class="axis" x1="84" y1="48" x2="84" y2="348"/>
+<text class="label" x="392.0" y="400" text-anchor="middle">p50 latency</text>
+<text class="label" x="20" y="198.0" transform="rotate(-90 20 198.0)" text-anchor="middle">NDCG@10</text>
+<circle cx="84.0" cy="127.7" r="8" fill="#1f6feb" opacity="0.9"/>
+<text x="96.0" y="121.7" class="label" fill="#1f6feb" text-anchor="start">local</text>
+<text x="96.0" y="139.7" class="subtitle" fill="#1f6feb" text-anchor="start">NDCG 0.854, Recall 0.946</text>
+<circle cx="686.7" cy="346.5" r="8" fill="#d29922" opacity="0.9"/>
+<text x="674.7" y="340.5" class="label" fill="#d29922" text-anchor="end">remote</text>
+<text x="674.7" y="358.5" class="subtitle" fill="#d29922" text-anchor="end">NDCG 0.453, Recall 0.467</text>
+<circle cx="700.0" cy="108.1" r="8" fill="#1a7f37" opacity="0.9"/>
+<text x="688.0" y="102.1" class="label" fill="#1a7f37" text-anchor="end">hybrid</text>
+<text x="688.0" y="120.1" class="subtitle" fill="#1a7f37" text-anchor="end">NDCG 0.890, Recall 0.979</text>
+</svg>

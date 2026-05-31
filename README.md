@@ -45,6 +45,13 @@ Remote failure path:
 
 ```text
 fast-context/
+├── benchmarks/
+│   ├── data.py               # Semble benchmark subset loader and pinned repo checks
+│   ├── metrics.py            # File-level retrieval metrics and bootstrap CIs
+│   └── run_retrieval_benchmark.py   # Paced local/remote/hybrid benchmark runner
+├── assets/
+│   └── images/
+│       └── retrieval_benchmark_speed_vs_quality.svg
 ├── src/
 │   ├── core.py               # Protocol, search loop, repo map, local lexical anchors
 │   ├── extract_key.py        # Windsurf credential extraction from state.vscdb
@@ -209,28 +216,79 @@ These results are empirical rather than guaranteed. Upstream capacity variance c
 
 ## Retrieval benchmark
 
-Local testing on `2026-05-31` reused Semble's benchmark protocol: pinned repos, annotation JSON as ground truth, and NDCG/recall metrics from `benchmarks/metrics.py`. To keep remote Windsurf usage practical, the run sampled 12 queries from two synced Semble benchmark repos (`fastapi` and `axios`), with 2 queries per category (`architecture`, `semantic`, `symbol`) per repo.
+The original 12-query smoke test is replaced by a full 40-query run over the two Semble benchmark repos already synced locally on this machine:
 
-Command settings:
+- `fastapi` at `c3c9dd6b1a08` (`benchmark_root=fastapi`)
+- `axios` at `c7a76ddbf277` (`benchmark_root=lib`)
+- 40 labeled queries total: 12 `architecture`, 17 `semantic`, 11 `symbol`
 
-- `max_results=10`
-- `max_turns=2`
-- `timeout_ms=30000`
-- backends compared: `local`, `remote`, `hybrid`
+The benchmark runner is [`benchmarks/run_retrieval_benchmark.py`](benchmarks/run_retrieval_benchmark.py). By default it mirrors Semble's protocol where that still fits this repo:
 
-| Backend | NDCG@10 | Recall@10 | Top-1 | MRR | p50 latency | Remote/degradation errors |
+- reuse Semble annotation JSON as ground truth
+- enforce pinned repo revisions before the run starts
+- score all backends against the same file-level relevance targets
+  - file-level scoring is deliberate: `remote` returns file/range hits, while `local` returns chunks
+- warm the local Semble cache once per repo, then measure query latency
+- run `remote` and `hybrid` sequentially with a `2.0s + jitter` start-gap and capped exponential-backoff retries for retryable upstream errors
+- alternate `remote` / `hybrid` order per query to reduce order bias
+- compute 95% bootstrap confidence intervals from per-query metrics
+
+Reproduce the run and regenerate the chart:
+
+```bash
+uv run python -m benchmarks.run_retrieval_benchmark \
+  --clear-local-cache \
+  --output benchmarks/results/retrieval-fastapi-axios-2026-06-01.json \
+  --plot assets/images/retrieval_benchmark_speed_vs_quality.svg
+```
+
+The benchmark script looks for a sibling `../semble/benchmarks` checkout by default. Override with `SEMBLE_BENCHMARK_ROOT=/path/to/semble/benchmarks` when needed.
+
+Artifacts from the run:
+
+- JSON summary and per-query traces: [`benchmarks/results/retrieval-fastapi-axios-2026-06-01.json`](benchmarks/results/retrieval-fastapi-axios-2026-06-01.json)
+- Speed-vs-quality chart: [`assets/images/retrieval_benchmark_speed_vs_quality.svg`](assets/images/retrieval_benchmark_speed_vs_quality.svg)
+
+![Retrieval benchmark speed vs quality](assets/images/retrieval_benchmark_speed_vs_quality.svg)
+
+### Quality summary
+
+| Backend | NDCG@10 | 95% CI | Recall@10 | 95% CI | Top-1 | MRR |
 |---|---:|---:|---:|---:|---:|---:|
-| `local` | 0.865 | 1.000 | 0.833 | 0.903 | 197 ms | 0 |
-| `remote` | 0.630 | 0.667 | 0.667 | 0.667 | 4.87 s | 4 |
-| `hybrid` | 0.895 | 1.000 | 0.833 | 0.917 | 4.05 s | 8 |
+| `local` | 0.854 | 0.774-0.926 | 0.946 | 0.875-1.000 | 0.775 | 0.850 |
+| `remote` | 0.453 | 0.309-0.604 | 0.467 | 0.312-0.617 | 0.450 | 0.475 |
+| `hybrid` | 0.890 | 0.835-0.939 | 0.979 | 0.946-1.000 | 0.825 | 0.896 |
 
-Interpretation:
+### Operational summary
 
-- `local` is the fastest path and already has strong recall once the Semble cache is warm.
-- `remote` is strong when upstream succeeds, but its end-to-end result is sensitive to auth, rate limit, and transient backend failures.
-- `hybrid` was the best default in this run: Semble chunk prefetch preserved recall, while Windsurf verification/expansion improved ranking quality. When remote degraded, local chunks still kept the output usable.
+| Backend | Batch p50 latency | Batch p90 latency | Final non-empty output | Remote success | `resource_exhausted` / degraded | Total retries |
+|---|---:|---:|---:|---:|---:|---:|
+| `local` | 30 ms | 39 ms | 100% | n/a | 0 | 0 |
+| `remote` | 24.4 s | 37.5 s | 50% | 52.5% | 19 | 43 |
+| `hybrid` | 28.3 s | 40.0 s | 100% | 50.0% | 20 degraded | 44 |
 
-This is a small operational benchmark, not a statistically complete replacement for Semble's full 1,251-query benchmark suite. It is intended to validate the fast-context integration shape and default backend choice.
+Warm local cache build cost, measured separately before timing queries:
+
+- `fastapi`: 422 ms
+- `axios`: 65 ms
+
+### By category
+
+NDCG@10 by query category:
+
+| Category | `local` | `remote` | `hybrid` |
+|---|---:|---:|---:|
+| `architecture` | 0.718 | 0.506 | 0.819 |
+| `semantic` | 0.855 | 0.473 | 0.869 |
+| `symbol` | 1.000 | 0.364 | 1.000 |
+
+### Interpretation
+
+- `local` is the throughput baseline: warm-cache p50 is `30 ms`, quality is already strong (`0.854` NDCG@10 / `0.946` recall@10), and the run had zero failures.
+- `hybrid` produced the best mean retrieval quality in this 40-query batch (`0.890` NDCG@10 / `0.979` recall@10) and guaranteed non-empty output because every upstream failure degraded to local Semble chunks.
+- The quality lift from `hybrid` over `local` is real but modest on this subset: paired bootstrap gives `+0.036` NDCG@10 with a 95% CI of `[-0.002, 0.079]`, and `+0.033` recall@10 with a 95% CI of `[0.000, 0.092]`.
+- `remote` and the remote half of `hybrid` were stable only in the first half of the batch. The first 20 `remote` queries all succeeded with a success-only p50 around `4.9 s`; the back 20 hit upstream `resource_exhausted` on `19/20` queries, which pulled full-batch `remote` p50 to `24.4 s`.
+- In other words: `hybrid` is still the safe default when you explicitly want Windsurf verification and can tolerate upstream variance, while `local` is the better choice for bulk evals, CI, and low-latency repo search.
 
 ## Skill usage
 
@@ -240,9 +298,10 @@ Typical flow:
 
 1. Run Fast Context with a natural-language query. Default `--backend hybrid` prefetches local Semble chunks, then uses Windsurf to verify and expand.
 2. Read the returned files.
-3. Use `--backend remote` only when you want to isolate Windsurf behavior without local chunk hints.
-4. Use `find-related` to follow a promising local chunk to similar code.
-5. Confirm exact call sites or symbols with `rg` or `ast-grep`.
+3. Use `--backend local` for bulk runs, CI, and low-latency repo search without any Windsurf dependency.
+4. Use `--backend remote` only when you want to isolate Windsurf behavior without local chunk hints.
+5. Use `find-related` to follow a promising local chunk to similar code.
+6. Confirm exact call sites or symbols with `rg` or `ast-grep`.
 
 ## Notes
 

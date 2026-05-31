@@ -13,7 +13,4 @@ venv/
 *.egg-info/
 dist/
 build/
-test_*.py
-!tests/test_output_format.py
-!tests/test_model_fallback.py
-!tests/test_local_semble.py
+/test_*.py

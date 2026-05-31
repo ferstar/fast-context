@@ -25,6 +25,11 @@ def _build_parser() -> argparse.ArgumentParser:
     search_parser.add_argument("--max-results", type=int, default=10, help="Max files to return")
     search_parser.add_argument("--timeout-ms", type=int, default=30000, help="Streaming timeout in ms")
     search_parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Show anchor snippets and diagnostic config in successful output.",
+    )
+    search_parser.add_argument(
         "--exclude",
         action="append",
         default=[],
@@ -47,6 +52,7 @@ def run_search(args: argparse.Namespace) -> int:
         tree_depth=args.tree_depth,
         timeout_ms=args.timeout_ms,
         exclude_paths=args.exclude,
+        verbose=args.verbose,
     )
     print(result)
     return 0

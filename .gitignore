@@ -15,3 +15,4 @@ dist/
 build/
 uv.lock
 test_*.py
+!tests/test_output_format.py

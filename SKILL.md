@@ -69,7 +69,9 @@ python "$SKILL_DIR/src/fast_context_cli.py" extract-key --db-path "<copied-state
 ## Output expectations
 
 - Prefer 3-10 candidate files, not a dump.
-- Include the returned grep keywords when they help the next exact search.
+- Prefer file paths plus a few labeled semantic blocks over raw range dumps.
+- Include the returned follow-up search terms when they help the next exact search.
+- Add `--verbose` only when you need anchor snippets or config diagnostics.
 - Treat the output as candidate context, not proof. Verification still matters.
 
 ## Files

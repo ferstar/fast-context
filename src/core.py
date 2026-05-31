@@ -208,6 +208,64 @@ QUERY_STOPWORDS = {
     "also", "like", "help", "quick", "quickly", "before", "after", "state",
 }
 
+GENERIC_GREP_PATTERNS = QUERY_STOPWORDS | {
+    "api",
+    "app",
+    "args",
+    "block",
+    "class",
+    "command",
+    "commands",
+    "config",
+    "content",
+    "core",
+    "data",
+    "error",
+    "exec",
+    "exec_command",
+    "function",
+    "functions",
+    "import",
+    "imports",
+    "key",
+    "keys",
+    "line",
+    "lines",
+    "main",
+    "meta",
+    "module",
+    "output",
+    "parse",
+    "path",
+    "paths",
+    "range",
+    "ranges",
+    "response",
+    "result",
+    "results",
+    "round",
+    "search",
+    "symbol",
+    "symbols",
+    "text",
+    "tool",
+    "tools",
+}
+
+SYMBOL_PATTERNS: list[tuple[re.Pattern[str], Callable[[re.Match[str]], str]]] = [
+    (re.compile(r"^\s*(?:async\s+)?def\s+([A-Za-z_][A-Za-z0-9_]*)\s*\("), lambda m: f"{m.group(1)}()"),
+    (re.compile(r"^\s*class\s+([A-Za-z_][A-Za-z0-9_]*)\b"), lambda m: m.group(1)),
+    (re.compile(r"^\s*(?:export\s+)?(?:async\s+)?function\s+([A-Za-z_$][A-Za-z0-9_$]*)\s*\("), lambda m: f"{m.group(1)}()"),
+    (re.compile(r"^\s*(?:export\s+)?class\s+([A-Za-z_$][A-Za-z0-9_$]*)\b"), lambda m: m.group(1)),
+    (re.compile(r"^\s*(?:export\s+)?(?:const|let|var)\s+([A-Za-z_$][A-Za-z0-9_$]*)\s*="), lambda m: m.group(1)),
+    (re.compile(r"^\s*(?:pub\s+)?fn\s+([A-Za-z_][A-Za-z0-9_]*)\s*\("), lambda m: f"{m.group(1)}()"),
+    (re.compile(r"^\s*(?:pub\s+)?struct\s+([A-Za-z_][A-Za-z0-9_]*)\b"), lambda m: m.group(1)),
+    (re.compile(r"^\s*(?:pub\s+)?enum\s+([A-Za-z_][A-Za-z0-9_]*)\b"), lambda m: m.group(1)),
+    (re.compile(r"^\s*impl\s+([A-Za-z_][A-Za-z0-9_]*)\b"), lambda m: f"impl {m.group(1)}"),
+]
+
+COMMENT_PREFIXES = ("#", "//", "///", "//!", "/*", "*")
+
 
 class FastContextError(RuntimeError):
     """Structured error for HTTP/network failures."""
@@ -1542,6 +1600,229 @@ def _parse_answer(xml_text: str, project_root: str) -> Dict[str, Any]:
     return {"files": files}
 
 
+def _truncate_display(text: str, limit: int = 96) -> str:
+    compact = re.sub(r"\s+", " ", text.strip())
+    if len(compact) <= limit:
+        return compact
+    return compact[: limit - 3].rstrip() + "..."
+
+
+def _clean_comment_text(text: str) -> str:
+    stripped = text.strip()
+    for prefix in COMMENT_PREFIXES:
+        if stripped.startswith(prefix):
+            stripped = stripped[len(prefix) :].strip()
+    stripped = stripped.removeprefix('"""').removeprefix("'''").strip()
+    stripped = stripped.removesuffix('"""').removesuffix("'''").strip()
+    return _truncate_display(stripped)
+
+
+def _coalesce_ranges(ranges: list[tuple[int, int]]) -> list[tuple[int, int]]:
+    if not ranges:
+        return []
+    merged = [ranges[0]]
+    for start, end in ranges[1:]:
+        prev_start, prev_end = merged[-1]
+        if start <= prev_end + 2:
+            merged[-1] = (prev_start, max(prev_end, end))
+            continue
+        merged.append((start, end))
+    return merged
+
+
+def _find_symbol_label(lines: list[str], start: int, end: int) -> tuple[str | None, int | None]:
+    lower = max(0, start)
+    upper = min(len(lines), end + 1)
+    for idx in range(lower, upper):
+        line = lines[idx]
+        for pattern, formatter in SYMBOL_PATTERNS:
+            match = pattern.match(line)
+            if match:
+                return formatter(match), idx
+    return None, None
+
+
+def _extract_doc_or_comment(
+    lines: list[str],
+    start: int,
+    end: int,
+    symbol_idx: int | None,
+) -> str | None:
+    if symbol_idx is None:
+        return None
+
+    search_end = min(len(lines), end + 1)
+    for idx in range(symbol_idx + 1, min(search_end, symbol_idx + 6)):
+        stripped = lines[idx].strip()
+        if not stripped:
+            continue
+        if stripped.startswith(('"""', "'''")):
+            if len(stripped) > 6 and stripped.endswith(('"""', "'''")):
+                return _clean_comment_text(stripped)
+            block = [_clean_comment_text(stripped)]
+            for follow in range(idx + 1, min(search_end, idx + 5)):
+                next_stripped = lines[follow].strip()
+                if not next_stripped:
+                    continue
+                block.append(_clean_comment_text(next_stripped))
+                if next_stripped.endswith(('"""', "'''")):
+                    break
+            block = [item for item in block if item]
+            return _truncate_display(" ".join(block)) if block else None
+        if any(stripped.startswith(prefix) for prefix in COMMENT_PREFIXES):
+            return _clean_comment_text(stripped)
+        break
+
+    comment_lines: list[str] = []
+    for idx in range(symbol_idx - 1, max(start - 1, symbol_idx - 4), -1):
+        stripped = lines[idx].strip()
+        if not stripped:
+            if comment_lines:
+                break
+            continue
+        if any(stripped.startswith(prefix) for prefix in COMMENT_PREFIXES):
+            comment_lines.append(_clean_comment_text(stripped))
+            continue
+        break
+    if comment_lines:
+        comment_lines.reverse()
+        return _truncate_display(" ".join(part for part in comment_lines if part))
+    return None
+
+
+def _match_query_terms(text: str, query_terms: list[str], limit: int = 3) -> list[str]:
+    lowered = text.lower()
+    matches: list[str] = []
+    for term in query_terms:
+        normalized = term.lower()
+        if len(normalized) < 4 or normalized in GENERIC_GREP_PATTERNS:
+            continue
+        if normalized in lowered:
+            matches.append(term)
+        if len(matches) >= limit:
+            break
+    return matches
+
+
+def _find_anchor_text(lines: list[str], start: int, end: int, symbol_idx: int | None) -> str | None:
+    if symbol_idx is not None and 0 <= symbol_idx < len(lines):
+        return _truncate_display(lines[symbol_idx])
+    for idx in range(max(0, start), min(len(lines), end + 1)):
+        stripped = lines[idx].strip()
+        if stripped:
+            return _truncate_display(stripped)
+    return None
+
+
+def _summarize_range(
+    lines: list[str],
+    start: int,
+    end: int,
+    query_terms: list[str],
+    verbose: bool,
+) -> tuple[str, str | None]:
+    start_idx = max(0, start - 1)
+    end_idx = max(start_idx, min(len(lines) - 1, end - 1)) if lines else start_idx
+    symbol_label, symbol_idx = _find_symbol_label(lines, start_idx, end_idx)
+    anchor = _find_anchor_text(lines, start_idx, end_idx, symbol_idx)
+    reason = _extract_doc_or_comment(lines, start_idx, end_idx, symbol_idx)
+    if not reason:
+        block_text = "".join(lines[start_idx : end_idx + 1])
+        matches = _match_query_terms(block_text, query_terms)
+        if matches:
+            reason = f"matches: {', '.join(matches)}"
+
+    title = symbol_label or anchor or "selected semantic block"
+    line = f"L{start}-{end}: {title}"
+    if reason:
+        line += f" - {reason}"
+
+    if verbose and anchor:
+        return line, anchor
+    return line, None
+
+
+def _filter_signal_patterns(patterns: list[str], query_terms: list[str]) -> list[str]:
+    query_term_set = {term.lower() for term in query_terms}
+    kept: list[str] = []
+    for pattern in patterns:
+        text = pattern.strip()
+        lowered = text.lower()
+        if len(text) < 3 or lowered in GENERIC_GREP_PATTERNS:
+            continue
+        has_structure = (
+            bool(re.search(r"[A-Z_]", text))
+            or any(ch in text for ch in "./:-")
+            or bool(re.search(r"[\[\](){}*+?|\\]", text))
+            or any(ch.isdigit() for ch in text)
+        )
+        if has_structure or (lowered in query_term_set and len(lowered) >= 6):
+            kept.append(text)
+    return list(dict.fromkeys(kept))
+
+
+def _format_success_output(
+    files: list[dict[str, Any]],
+    query: str,
+    rg_patterns: list[str],
+    meta: dict[str, Any],
+    raw_response: str,
+    max_turns: int,
+    max_results: int,
+    max_commands: int,
+    timeout_ms: int,
+    exclude_paths: list[str] | None,
+    verbose: bool,
+) -> str:
+    query_terms = _extract_query_terms(query, max_terms=12)
+    signal_patterns = _filter_signal_patterns(rg_patterns, query_terms)
+    parts: list[str] = []
+
+    if files:
+        parts.append("Start here:")
+        parts.append("")
+        for index, entry in enumerate(files, 1):
+            parts.append(f"{index}. {entry['full_path']}")
+            try:
+                with open(entry["full_path"], "r", encoding="utf-8", errors="replace") as handle:
+                    lines = handle.readlines()
+            except OSError:
+                lines = []
+            for start, end in _coalesce_ranges(entry["ranges"]):
+                summary, anchor = _summarize_range(lines, start, end, query_terms, verbose)
+                parts.append(f"   - {summary}")
+                if anchor:
+                    parts.append(f"     anchor: {anchor}")
+            parts.append("")
+    elif signal_patterns:
+        parts.append("No direct file matches found.")
+        parts.append("")
+    else:
+        return f"No relevant files found.\n\nRaw response:\n{raw_response}" if raw_response else "No relevant files found."
+
+    if signal_patterns:
+        parts.append("Follow-up search terms:")
+        parts.append(", ".join(signal_patterns))
+        parts.append("")
+
+    if verbose and meta:
+        config_line = (
+            f"[config] tree_depth={meta.get('tree_depth')}, "
+            f"tree_size={meta.get('tree_size_kb')}KB, "
+            f"max_turns={max_turns}, max_results={max_results}, "
+            f"max_commands={max_commands}, timeout_ms={timeout_ms}"
+        )
+        if meta.get("fell_back"):
+            config_line += " (fell back from requested depth)"
+        if exclude_paths:
+            config_line += f", exclude_paths=[{', '.join(exclude_paths)}]"
+        parts.append(config_line)
+
+    while parts and not parts[-1]:
+        parts.pop()
+    return "\n".join(parts)
+
+
 def search_with_content(
     query: str,
     project_root: str,
@@ -1552,12 +1833,9 @@ def search_with_content(
     tree_depth: int = 3,
     timeout_ms: int = 30000,
     exclude_paths: list[str] | None = None,
+    verbose: bool = False,
 ) -> str:
-    """搜索并返回格式化结果（适合 CLI / skill 输出）。
-
-    返回 Fast Context 文件列表 + AI 搜索过程中使用的 rg 关键字列表。
-    调用方可用这些关键字自行搜索以扩大覆盖范围。
-    """
+    """搜索并返回适合 CLI / skill 的格式化结果。"""
     result = search(
         query=query, project_root=project_root,
         api_key=api_key,
@@ -1595,49 +1873,20 @@ def search_with_content(
 
     files = result.get("files", [])
     rg_patterns = result.get("rg_patterns", [])
-    # 去重 + 过滤太短的
-    unique_patterns = [p for p in dict.fromkeys(rg_patterns) if len(p) >= 3]
-
-    if not files and not unique_patterns:
-        raw = result.get("raw_response", "")
-        return f"No relevant files found.\n\nRaw response:\n{raw}" if raw else "No relevant files found."
-
-    parts: list[str] = []
-
-    # 第一部分：FC 搜索结果文件
-    n = len(files)
-    if files:
-        parts.append(
-            f"Found {n} relevant files. "
-            f"IMPORTANT: You MUST examine ALL {n} files below to fully understand the context."
-        )
-        parts.append("")
-        for i, entry in enumerate(files, 1):
-            ranges_str = ", ".join(f"L{s}-{e}" for s, e in entry["ranges"])
-            parts.append(f"  [{i}/{n}] {entry['full_path']} ({ranges_str})")
-    else:
-        parts.append("No direct file matches found.")
-
-    # 第二部分：推荐搜索关键字
-    if unique_patterns:
-        parts.append("")
-        parts.append(f"grep keywords: {', '.join(unique_patterns)}")
-
     meta = result.get("_meta") or {}
-    if meta:
-        parts.append("")
-        config_line = (
-            f"[config] tree_depth={meta.get('tree_depth')}, "
-            f"tree_size={meta.get('tree_size_kb')}KB, "
-            f"max_turns={max_turns}, max_results={max_results}, timeout_ms={timeout_ms}"
-        )
-        if meta.get("fell_back"):
-            config_line += " (fell back from requested depth)"
-        if exclude_paths:
-            config_line += f", exclude_paths=[{', '.join(exclude_paths)}]"
-        parts.append(config_line)
-
-    return "\n".join(parts)
+    return _format_success_output(
+        files=files,
+        query=query,
+        rg_patterns=rg_patterns,
+        meta=meta,
+        raw_response=result.get("raw_response", ""),
+        max_turns=max_turns,
+        max_results=max_results,
+        max_commands=max_commands,
+        timeout_ms=timeout_ms,
+        exclude_paths=exclude_paths,
+        verbose=verbose,
+    )
 
 
 def extract_key_info() -> dict:

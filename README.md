@@ -70,20 +70,25 @@ Useful options:
 - `--max-turns <1-5>`
 - `--max-results <1-30>`
 - `--timeout-ms <ms>`
+- `--verbose`
 - `--exclude <path-or-glob>` repeatable
 
 Example output:
 
 ```text
-Found 3 relevant files.
+Start here:
 
-  [1/3] /repo/apps/desktop/src/auth/session.ts (L18-102)
-  [2/3] /repo/apps/desktop/src/auth/handoff.ts (L5-88)
-  [3/3] /repo/apps/desktop/test/ipc-auth-boundary.integration.test.ts (L40-141)
+1. /repo/apps/desktop/src/auth/session.ts
+   - L18-102: applyExternalSession() - matches: handoff, state
 
-grep keywords: handoff, applyExternalSession, state
+2. /repo/apps/desktop/src/auth/handoff.ts
+   - L5-88: createAuthHandoff() - matches: handoff, desktop-launch
 
-[config] tree_depth=3, tree_size=11.8KB, max_turns=3, max_results=10, timeout_ms=30000
+3. /repo/apps/desktop/test/ipc-auth-boundary.integration.test.ts
+   - L40-141: rejects external-session callbacks without state - matches: state
+
+Follow-up search terms:
+applyExternalSession, createAuthHandoff, handoff.*state
 ```
 
 ### Extract Windsurf credential
@@ -124,6 +129,7 @@ Typical flow:
 - Local lexical anchors are generic. They bias toward exact filenames, path segments, and literal content hits from the query.
 - Repo maps shrink automatically when the tree gets too large.
 - If the remote call times out or the payload is too large, the search loop trims old context and retries once.
+- Successful output stays concise by default. Use `--verbose` when you want anchor snippets and config diagnostics.
 
 ## License
 

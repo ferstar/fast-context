@@ -58,22 +58,22 @@ class QueryResult:
 
 
 class RemotePacer:
-    def __init__(self, min_interval_ms: int, jitter_ms: int, seed: int) -> None:
-        self.min_interval_ms = min_interval_ms
+    def __init__(self, min_cooldown_ms: int, jitter_ms: int, seed: int) -> None:
+        self.min_cooldown_ms = min_cooldown_ms
         self.jitter_ms = jitter_ms
         self.rng = random.Random(seed)
-        self.last_started: float | None = None
+        self.last_finished: float | None = None
 
     def wait(self) -> None:
-        if self.last_started is None:
+        if self.last_finished is None:
             return
-        target_gap = (self.min_interval_ms + self.rng.uniform(0, self.jitter_ms)) / 1000.0
-        elapsed = time.monotonic() - self.last_started
+        target_gap = (self.min_cooldown_ms + self.rng.uniform(0, self.jitter_ms)) / 1000.0
+        elapsed = time.monotonic() - self.last_finished
         if elapsed < target_gap:
             time.sleep(target_gap - elapsed)
 
-    def note_start(self) -> None:
-        self.last_started = time.monotonic()
+    def note_finished(self) -> None:
+        self.last_finished = time.monotonic()
 
 
 def _mean(values: list[float]) -> float:
@@ -122,10 +122,11 @@ def _retryable_error(error_code: str | None, error_message: str | None) -> bool:
     return error_code in {"RATE_LIMITED", "TIMEOUT", "RESOURCE_EXHAUSTED"} or "resource_exhausted" in lowered
 
 
-def _sleep_with_jitter(base_ms: int, attempt: int, rng: random.Random) -> None:
-    cap_ms = base_ms * (2 ** attempt)
+def _sleep_with_jitter(base_ms: int, max_ms: int, attempt: int, rng: random.Random) -> float:
+    cap_ms = min(max_ms, base_ms * (2 ** attempt))
     delay_ms = rng.uniform(base_ms, cap_ms)
     time.sleep(delay_ms / 1000.0)
+    return delay_ms
 
 
 def _run_local(task: Task, project_root: str, max_results: int) -> QueryResult:
@@ -167,12 +168,14 @@ def _run_remote_with_retries(
     task: Task,
     project_root: str,
     *,
+    backend: str,
     max_results: int,
     max_turns: int,
     tree_depth: int,
     timeout_ms: int,
     pacer: RemotePacer,
     retry_base_ms: int,
+    retry_max_ms: int,
     max_retries: int,
     retry_seed: int,
     local_context: str | None = None,
@@ -181,7 +184,6 @@ def _run_remote_with_retries(
     rng = random.Random(retry_seed)
     while True:
         pacer.wait()
-        pacer.note_start()
         try:
             result = core.search(
                 query=task.query,
@@ -198,6 +200,7 @@ def _run_remote_with_retries(
                 "error": str(exc),
                 "_meta": {"error_code": "EXCEPTION"},
             }
+        pacer.note_finished()
         if not result.get("error"):
             return result, retries
         meta = result.get("_meta") or {}
@@ -205,7 +208,12 @@ def _run_remote_with_retries(
         if retries >= max_retries or not _retryable_error(error_code, result.get("error")):
             return result, retries
         retries += 1
-        _sleep_with_jitter(retry_base_ms, retries, rng)
+        delay_ms = _sleep_with_jitter(retry_base_ms, retry_max_ms, retries, rng)
+        reason = error_code or result.get("error") or "unknown"
+        print(
+            f"  [retry {retries}/{max_retries}] {backend} {task.repo} {task.query!r} after {reason}; sleeping {delay_ms / 1000:.1f}s",
+            file=sys.stderr,
+        )
 
 
 def _run_remote(
@@ -218,6 +226,7 @@ def _run_remote(
     timeout_ms: int,
     pacer: RemotePacer,
     retry_base_ms: int,
+    retry_max_ms: int,
     max_retries: int,
     retry_seed: int,
 ) -> QueryResult:
@@ -225,12 +234,14 @@ def _run_remote(
     result, retries = _run_remote_with_retries(
         task,
         project_root,
+        backend="remote",
         max_results=max_results,
         max_turns=max_turns,
         tree_depth=tree_depth,
         timeout_ms=timeout_ms,
         pacer=pacer,
         retry_base_ms=retry_base_ms,
+        retry_max_ms=retry_max_ms,
         max_retries=max_retries,
         retry_seed=retry_seed,
     )
@@ -272,6 +283,7 @@ def _run_hybrid(
     timeout_ms: int,
     pacer: RemotePacer,
     retry_base_ms: int,
+    retry_max_ms: int,
     max_retries: int,
     retry_seed: int,
 ) -> QueryResult:
@@ -289,12 +301,14 @@ def _run_hybrid(
     remote_result, retries = _run_remote_with_retries(
         task,
         project_root,
+        backend="hybrid",
         max_results=max_results,
         max_turns=max_turns,
         tree_depth=tree_depth,
         timeout_ms=timeout_ms,
         pacer=pacer,
         retry_base_ms=retry_base_ms,
+        retry_max_ms=retry_max_ms,
         max_retries=max_retries,
         retry_seed=retry_seed,
         local_context=prompt_context,
@@ -587,13 +601,22 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--max-turns", type=int, default=2, help="Remote search rounds.")
     parser.add_argument("--tree-depth", type=int, default=3, help="Repo tree depth for remote search.")
     parser.add_argument("--timeout-ms", type=int, default=30000, help="Remote search timeout in ms.")
-    parser.add_argument("--remote-sleep-ms", type=int, default=2000, help="Minimum gap between remote request starts.")
-    parser.add_argument("--remote-jitter-ms", type=int, default=750, help="Extra random remote pacing jitter.")
-    parser.add_argument("--retry-base-ms", type=int, default=5000, help="Base delay for retryable remote errors.")
-    parser.add_argument("--max-retries", type=int, default=2, help="Retries for retryable remote errors.")
+    parser.add_argument(
+        "--remote-cooldown-ms",
+        "--remote-sleep-ms",
+        dest="remote_cooldown_ms",
+        type=int,
+        default=10000,
+        help="Minimum cooldown after each remote attempt completes.",
+    )
+    parser.add_argument("--remote-jitter-ms", type=int, default=2000, help="Extra random remote pacing jitter.")
+    parser.add_argument("--retry-base-ms", type=int, default=15000, help="Base delay for retryable remote errors.")
+    parser.add_argument("--retry-max-ms", type=int, default=60000, help="Maximum delay for retryable remote errors.")
+    parser.add_argument("--max-retries", type=int, default=4, help="Retries for retryable remote errors.")
     parser.add_argument("--bootstrap-samples", type=int, default=5000, help="Bootstrap resamples for CI.")
     parser.add_argument("--seed", type=int, default=20260601, help="Seed for task order and retries.")
     parser.add_argument("--clear-local-cache", action="store_true", help="Clear local Semble cache before warm-up.")
+    parser.add_argument("--task-limit", type=int, default=0, help="Limit the number of shuffled tasks for a calibration run.")
     parser.add_argument("--output", default="", help="Path to write benchmark JSON.")
     parser.add_argument("--plot", default="", help="Path to write SVG plot.")
     return parser.parse_args()
@@ -609,6 +632,8 @@ def main() -> None:
 
     execution_tasks = list(tasks)
     random.Random(args.seed).shuffle(execution_tasks)
+    if args.task_limit > 0:
+        execution_tasks = execution_tasks[: args.task_limit]
 
     warmup: dict[str, dict[str, Any]] = {}
     for repo in repo_names:
@@ -624,7 +649,7 @@ def main() -> None:
             "warmup_ms": round((time.perf_counter() - started) * 1000, 1),
         }
 
-    pacer = RemotePacer(args.remote_sleep_ms, args.remote_jitter_ms, args.seed)
+    pacer = RemotePacer(args.remote_cooldown_ms, args.remote_jitter_ms, args.seed)
     results: list[QueryResult] = []
 
     for index, task in enumerate(execution_tasks, 1):
@@ -651,6 +676,7 @@ def main() -> None:
                     timeout_ms=args.timeout_ms,
                     pacer=pacer,
                     retry_base_ms=args.retry_base_ms,
+                    retry_max_ms=args.retry_max_ms,
                     max_retries=args.max_retries,
                     retry_seed=args.seed + index,
                 )
@@ -664,6 +690,7 @@ def main() -> None:
                     timeout_ms=args.timeout_ms,
                     pacer=pacer,
                     retry_base_ms=args.retry_base_ms,
+                    retry_max_ms=args.retry_max_ms,
                     max_retries=args.max_retries,
                     retry_seed=args.seed + index + 101,
                 )
@@ -674,18 +701,21 @@ def main() -> None:
         "dataset_root": str(dataset_root),
         "repos": repo_names,
         "task_count": len(tasks),
+        "executed_task_count": len(execution_tasks),
         "config": {
             "max_results": args.max_results,
             "max_turns": args.max_turns,
             "tree_depth": args.tree_depth,
             "timeout_ms": args.timeout_ms,
-            "remote_sleep_ms": args.remote_sleep_ms,
+            "remote_cooldown_ms": args.remote_cooldown_ms,
             "remote_jitter_ms": args.remote_jitter_ms,
             "retry_base_ms": args.retry_base_ms,
+            "retry_max_ms": args.retry_max_ms,
             "max_retries": args.max_retries,
             "bootstrap_samples": args.bootstrap_samples,
             "seed": args.seed,
             "clear_local_cache": args.clear_local_cache,
+            "task_limit": args.task_limit,
         },
         "checkouts": checkout_details,
         "warmup": warmup,

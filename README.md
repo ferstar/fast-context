@@ -229,7 +229,9 @@ The benchmark runner is [`benchmarks/run_retrieval_benchmark.py`](benchmarks/run
 - score all backends against the same file-level relevance targets
   - file-level scoring is deliberate: `remote` returns file/range hits, while `local` returns chunks
 - warm the local Semble cache once per repo, then measure query latency
-- run `remote` and `hybrid` sequentially with a `2.0s + jitter` start-gap and capped exponential-backoff retries for retryable upstream errors
+- run `remote` and `hybrid` sequentially with a completion-based cooldown
+  - current fair defaults are `remote_cooldown_ms=10000`, `remote_jitter_ms=2000`, `retry_base_ms=15000`, `retry_max_ms=60000`, `max_retries=4`
+  - cooldown is measured after each remote attempt completes, not just between request start times
 - alternate `remote` / `hybrid` order per query to reduce order bias
 - compute 95% bootstrap confidence intervals from per-query metrics
 
@@ -238,6 +240,11 @@ Reproduce the run and regenerate the chart:
 ```bash
 uv run python -m benchmarks.run_retrieval_benchmark \
   --clear-local-cache \
+  --remote-cooldown-ms 10000 \
+  --remote-jitter-ms 2000 \
+  --retry-base-ms 15000 \
+  --retry-max-ms 60000 \
+  --max-retries 4 \
   --output benchmarks/results/retrieval-fastapi-axios-2026-06-01.json \
   --plot assets/images/retrieval_benchmark_speed_vs_quality.svg
 ```
@@ -250,6 +257,12 @@ Artifacts from the run:
 - Speed-vs-quality chart: [`assets/images/retrieval_benchmark_speed_vs_quality.svg`](assets/images/retrieval_benchmark_speed_vs_quality.svg)
 
 ![Retrieval benchmark speed vs quality](assets/images/retrieval_benchmark_speed_vs_quality.svg)
+
+### Important note on fairness
+
+The `2026-06-01` numbers below were collected before the runner switched to completion-based cooldown. That older runner only enforced a start-gap, which meant any `~5s` remote call effectively launched the next one immediately after completion and could over-stress Windsurf during long batches. Treat the published `remote` / `hybrid` rows as an operational stress run, not the final apples-to-apples backend comparison.
+
+The current runner defaults are intentionally slower and fairer. Use them for any future published benchmark refresh.
 
 ### Quality summary
 
@@ -285,10 +298,10 @@ NDCG@10 by query category:
 ### Interpretation
 
 - `local` is the throughput baseline: warm-cache p50 is `30 ms`, quality is already strong (`0.854` NDCG@10 / `0.946` recall@10), and the run had zero failures.
-- `hybrid` produced the best mean retrieval quality in this 40-query batch (`0.890` NDCG@10 / `0.979` recall@10) and guaranteed non-empty output because every upstream failure degraded to local Semble chunks.
-- The quality lift from `hybrid` over `local` is real but modest on this subset: paired bootstrap gives `+0.036` NDCG@10 with a 95% CI of `[-0.002, 0.079]`, and `+0.033` recall@10 with a 95% CI of `[0.000, 0.092]`.
-- `remote` and the remote half of `hybrid` were stable only in the first half of the batch. The first 20 `remote` queries all succeeded with a success-only p50 around `4.9 s`; the back 20 hit upstream `resource_exhausted` on `19/20` queries, which pulled full-batch `remote` p50 to `24.4 s`.
-- In other words: `hybrid` is still the safe default when you explicitly want Windsurf verification and can tolerate upstream variance, while `local` is the better choice for bulk evals, CI, and low-latency repo search.
+- `local` is the stable throughput baseline and remains the safest choice for bulk evals, CI, and low-latency repo search.
+- The old `remote` / `hybrid` rows surfaced a runner bug more than a backend-quality truth: a start-gap alone was not enough to prevent long-batch upstream throttling.
+- The fair runner now uses completion-based cooldown plus capped retry windows, so the next published `remote` / `hybrid` numbers should be regenerated with the current defaults instead of compared directly against the stress-run table above.
+- In day-to-day usage, `hybrid` is still the right interactive default when you want Windsurf verification on top of local Semble hints. Just do not treat the older degraded batch result as its steady-state quality ceiling.
 
 ## Skill usage
 

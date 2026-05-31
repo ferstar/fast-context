@@ -114,6 +114,16 @@ Current Windsurf installs may store either classic API keys or session-style cre
 - `WS_APP_VER`
 - `WS_LS_VER`
 
+## Model choice
+
+Local testing on `2026-05-31` suggests these practical defaults:
+
+- `MODEL_SWE_1_6_FAST` is the best default for individual day-to-day coding use and one-off repo lookups.
+- If Windsurf starts returning repeated `resource_exhausted`, switch to `MODEL_SWE_1_5` first. It was the most stable fallback in local testing.
+- `MODEL_SWE_1_7_FAST` is currently not recommended.
+
+These results are empirical rather than guaranteed. Upstream capacity variance can affect both latency and success rate.
+
 ## Skill usage
 
 The intended usage is through `SKILL.md`, but the CLI is also fine for direct local runs and quick repo checks.

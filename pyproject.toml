@@ -9,11 +9,13 @@ description = "Python-first fast repository context search powered by Windsurf's
 readme = "README.md"
 license = {text = "MIT"}
 requires-python = ">=3.10"
-dependencies = []
+dependencies = [
+    "semble>=0.3.1",
+]
 
 [project.scripts]
 fast-context = "fast_context_cli:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}
-py-modules = ["core", "extract_key", "fast_context_cli"]
+py-modules = ["core", "extract_key", "fast_context_cli", "local_semble"]

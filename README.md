@@ -4,7 +4,7 @@ Python-first fast repository context search for Codex/Claude-style skills.
 
 This repo replaces the Node/MCP packaging with a simple Python CLI and skill workflow. It still talks to Windsurf's reverse-engineered SWE-grep backend, but now keeps the local side lean:
 
-- zero runtime dependencies beyond Python itself
+- local Semble prefetch for cached chunk candidates
 - local Windsurf credential extraction from `state.vscdb`
 - local lexical anchors before the remote semantic loop
 - adaptive repo-map depth to avoid oversized payloads
@@ -14,12 +14,14 @@ This repo replaces the Node/MCP packaging with a simple Python CLI and skill wor
 
 The high-ROI path for code search is not prompt tricks. It is a hybrid retrieval loop:
 
-1. Keep exact lexical evidence from the local repo: filenames, paths, literal terms.
-2. Give that evidence plus a compact repo map to the remote semantic search loop.
-3. Let Windsurf drive `rg`, `readfile`, `tree`, `ls`, and `glob` calls.
-4. Return a small set of files that are actually worth reading next.
+1. Run Semble locally first to get warm-cache chunk candidates.
+2. Keep exact lexical evidence from the local repo: filenames, paths, literal terms.
+3. Give Semble candidates, lexical evidence, and a compact repo map to the remote semantic search loop.
+4. Let Windsurf verify and expand with `rg`, `readfile`, `tree`, `ls`, and `glob` calls.
+5. If the remote path is unavailable, degrade to local Semble chunk retrieval.
+6. Return a small set of files or chunks that are actually worth reading next.
 
-This repo implements the local side in Python so it is easy to run in a skill without dragging in Node dependencies.
+This repo implements the local side in Python so it is easy to run in a skill. Semble is used as the high-ROI local index backend for warm, cached chunk retrieval, while Windsurf remains responsible for agentic verification and call-chain expansion.
 
 ## Files
 
@@ -28,6 +30,7 @@ fast-context/
 ├── src/
 │   ├── core.py               # Protocol, search loop, repo map, local lexical anchors
 │   ├── extract_key.py        # Windsurf credential extraction from state.vscdb
+│   ├── local_semble.py       # Local Semble adapter and uvx fallback
 │   └── fast_context_cli.py   # CLI entrypoint for the skill
 ├── SKILL.md              # Skill instructions
 ├── pyproject.toml
@@ -38,6 +41,7 @@ fast-context/
 
 - Python 3.10+
 - A Windsurf login on the same machine, or `WINDSURF_API_KEY`
+- Semble for local chunk search. `pip install -e .` installs it; direct skill usage can also fall back to `uvx --from semble`.
 - `rg` is optional but recommended. Python fallback search is built in.
 
 ## Install
@@ -66,12 +70,14 @@ python src/fast_context_cli.py search \
 
 Useful options:
 
+- `--backend hybrid|remote|local|auto` (`hybrid` is default; `auto` is a backward-compatible alias)
 - `--tree-depth <1-6>`
 - `--max-turns <1-5>`
 - `--max-results <1-30>`
 - `--timeout-ms <ms>`
 - `--verbose`
 - `--exclude <path-or-glob>` repeatable
+- `--content code|docs|config|all` for Semble prefetch and local-only search
 
 Example output:
 
@@ -89,6 +95,36 @@ Start here:
 
 Follow-up search terms:
 applyExternalSession, createAuthHandoff, handoff.*state
+```
+
+`--backend hybrid` runs Semble first, injects the top local chunks into the Windsurf search prompt, then asks Windsurf to verify and expand with restricted repo tools. If the remote path fails, including auth errors, timeouts, and upstream `resource_exhausted`, the CLI still returns the local Semble chunks so the agent can keep moving.
+
+### Local Semble search
+
+Run cached local chunk retrieval directly:
+
+```bash
+python src/fast_context_cli.py local-search \
+  --query "how semantic and lexical scores are fused" \
+  --project .
+```
+
+Search documentation or config:
+
+```bash
+python src/fast_context_cli.py local-search \
+  --query "deployment guide" \
+  --project . \
+  --content docs
+```
+
+Find chunks related to a prior result:
+
+```bash
+python src/fast_context_cli.py find-related \
+  --file src/search.py \
+  --line 77 \
+  --project .
 ```
 
 ### Extract Windsurf credential
@@ -114,6 +150,9 @@ Current Windsurf installs may store either classic API keys or session-style cre
 - `WS_FALLBACK_MODELS`: optional comma-separated fallback chain. Default is `MODEL_SWE_1_5`
 - `WS_APP_VER`
 - `WS_LS_VER`
+- `FAST_CONTEXT_SEMBLE_PYTHON`: Python version used by the `uvx --from semble` fallback. Default is `3.13`
+- `FAST_CONTEXT_SEMBLE_TIMEOUT`: timeout in seconds for the `uvx --from semble` fallback. Default is `120`
+- `FAST_CONTEXT_SEMBLE_UVX`: uvx executable path. Default is `uvx`
 
 ## Model choice
 
@@ -132,15 +171,19 @@ The intended usage is through `SKILL.md`, but the CLI is also fine for direct lo
 
 Typical flow:
 
-1. Run Fast Context with a natural-language query.
+1. Run Fast Context with a natural-language query. Default `--backend hybrid` prefetches local Semble chunks, then uses Windsurf to verify and expand.
 2. Read the returned files.
-3. Confirm exact call sites or symbols with `rg` or `ast-grep`.
+3. Use `--backend remote` only when you want to isolate Windsurf behavior without local chunk hints.
+4. Use `find-related` to follow a promising local chunk to similar code.
+5. Confirm exact call sites or symbols with `rg` or `ast-grep`.
 
 ## Notes
 
 - Local lexical anchors are generic. They bias toward exact filenames, path segments, and literal content hits from the query.
 - Repo maps shrink automatically when the tree gets too large.
 - If the remote call times out or the payload is too large, the search loop trims old context and retries once.
+- Semble caches local indexes and invalidates them when files change.
+- Semble chunk hits are candidate evidence, not proof. Hybrid mode asks Windsurf to verify them before producing the main `Start here` output.
 - Successful output stays concise by default. Use `--verbose` when you want anchor snippets and config diagnostics.
 
 ## License

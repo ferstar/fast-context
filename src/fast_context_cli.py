@@ -6,8 +6,18 @@ import argparse
 import sys
 from pathlib import Path
 
-from core import search_with_content
+from core import find_related_with_content, local_search_with_content, search_with_content
 from extract_key import extract_key
+
+
+def _add_local_content_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--content",
+        nargs="+",
+        default=["code"],
+        choices=["code", "docs", "config", "all"],
+        help="Content types for local Semble search.",
+    )
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -25,6 +35,16 @@ def _build_parser() -> argparse.ArgumentParser:
     search_parser.add_argument("--max-results", type=int, default=10, help="Max files to return")
     search_parser.add_argument("--timeout-ms", type=int, default=30000, help="Streaming timeout in ms")
     search_parser.add_argument(
+        "--backend",
+        choices=["hybrid", "remote", "local", "auto"],
+        default="hybrid",
+        help=(
+            "Search backend. hybrid prefetches local Semble chunks, injects them "
+            "into Windsurf search, and uses local results if remote search fails."
+        ),
+    )
+    _add_local_content_args(search_parser)
+    search_parser.add_argument(
         "--verbose",
         action="store_true",
         help="Show anchor snippets and diagnostic config in successful output.",
@@ -35,6 +55,21 @@ def _build_parser() -> argparse.ArgumentParser:
         default=[],
         help="Extra exclude path or glob. Repeatable.",
     )
+
+    local_parser = subparsers.add_parser("local-search", help="Run local Semble chunk search")
+    local_parser.add_argument("--query", required=True, help="Natural language query")
+    local_parser.add_argument("--project", default=".", help="Project root directory")
+    local_parser.add_argument("--max-results", type=int, default=10, help="Max chunks to return")
+    local_parser.add_argument("--verbose", action="store_true", help="Show local backend diagnostics.")
+    _add_local_content_args(local_parser)
+
+    related_parser = subparsers.add_parser("find-related", help="Find local chunks related to a file and line")
+    related_parser.add_argument("--file", required=True, help="Repo-relative file path from a search result")
+    related_parser.add_argument("--line", required=True, type=int, help="Line number inside the source chunk")
+    related_parser.add_argument("--project", default=".", help="Project root directory")
+    related_parser.add_argument("--max-results", type=int, default=10, help="Max chunks to return")
+    related_parser.add_argument("--verbose", action="store_true", help="Show local backend diagnostics.")
+    _add_local_content_args(related_parser)
 
     extract_parser = subparsers.add_parser("extract-key", help="Extract Windsurf credential")
     extract_parser.add_argument("--db-path", help="Path to a copied state.vscdb")
@@ -52,6 +87,35 @@ def run_search(args: argparse.Namespace) -> int:
         tree_depth=args.tree_depth,
         timeout_ms=args.timeout_ms,
         exclude_paths=args.exclude,
+        verbose=args.verbose,
+        backend=args.backend,
+        content_types=args.content,
+    )
+    print(result)
+    return 0
+
+
+def run_local_search(args: argparse.Namespace) -> int:
+    project_root = str(Path(args.project).expanduser().resolve())
+    result = local_search_with_content(
+        query=args.query,
+        project_root=project_root,
+        max_results=args.max_results,
+        content_types=args.content,
+        verbose=args.verbose,
+    )
+    print(result)
+    return 0
+
+
+def run_find_related(args: argparse.Namespace) -> int:
+    project_root = str(Path(args.project).expanduser().resolve())
+    result = find_related_with_content(
+        file_path=args.file,
+        line=args.line,
+        project_root=project_root,
+        max_results=args.max_results,
+        content_types=args.content,
         verbose=args.verbose,
     )
     print(result)
@@ -88,6 +152,10 @@ def main() -> int:
 
     if args.command == "search":
         return run_search(args)
+    if args.command == "local-search":
+        return run_local_search(args)
+    if args.command == "find-related":
+        return run_find_related(args)
     if args.command == "extract-key":
         return run_extract_key(args)
 

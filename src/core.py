@@ -33,6 +33,8 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
+from local_semble import SembleUnavailable, find_related as semble_find_related, search as semble_search
+
 
 # ─── SSL ────────────────────────────────────────────────────
 
@@ -1570,6 +1572,7 @@ def search(
     tree_depth: int = 3,
     timeout_ms: int = 30000,
     exclude_paths: list[str] | None = None,
+    local_context: str | None = None,
     on_progress: Callable[[str], None] | None = None,
 ) -> Dict[str, Any]:
     """
@@ -1586,6 +1589,7 @@ def search(
         tree_depth: repo map 目标深度（1-6）
         timeout_ms: 流式请求超时
         exclude_paths: 额外排除路径
+        local_context: 本地检索候选 chunk，注入远端搜索提示
         on_progress: 进度回调
 
     Returns:
@@ -1624,6 +1628,7 @@ def search(
     )
     user_content = "\n\n".join([
         f"Problem Statement: {query}",
+        local_context or "",
         local_anchor_brief,
         f"Repo Map (tree -L {actual_depth} /codebase):\n```text\n{repo_map}\n```",
     ]).strip()
@@ -1947,6 +1952,174 @@ def _format_success_output(
     return "\n".join(parts)
 
 
+def _chunk_title_and_snippet(content: str) -> tuple[str, str | None]:
+    lines = content.splitlines()
+    symbol_label, symbol_idx = _find_symbol_label([line + "\n" for line in lines], 0, len(lines) - 1)
+    if symbol_label:
+        start = max(0, symbol_idx or 0)
+        snippet_lines = [line.strip() for line in lines[start : start + 3] if line.strip()]
+        return symbol_label, _truncate_display(" ".join(snippet_lines), 160) if snippet_lines else None
+    for line in lines:
+        stripped = line.strip()
+        if stripped:
+            return _truncate_display(stripped), _truncate_display(stripped, 160)
+    return "selected local chunk", None
+
+
+def _format_semble_output(
+    payload: dict[str, Any],
+    project_root: str,
+    verbose: bool = False,
+    heading: str = "Local Semble results:",
+) -> str:
+    results = payload.get("results") or []
+    if not results:
+        return "No local Semble chunks found."
+
+    root = Path(project_root).expanduser().resolve()
+    parts = [heading, ""]
+    for index, item in enumerate(results, 1):
+        chunk = item.get("chunk") or {}
+        rel_path = chunk.get("file_path") or ""
+        full_path = root / rel_path if rel_path else root
+        start = chunk.get("start_line")
+        end = chunk.get("end_line")
+        score = item.get("score")
+        title, snippet = _chunk_title_and_snippet(chunk.get("content") or "")
+        score_text = f", score={float(score):.4f}" if isinstance(score, (int, float)) else ""
+        parts.append(f"{index}. {full_path}")
+        parts.append(f"   - L{start}-{end}: {title}{score_text}")
+        if snippet:
+            parts.append(f"     snippet: {snippet}")
+        parts.append("")
+
+    meta = payload.get("_meta") or {}
+    if verbose and meta:
+        runner = meta.get("runner", "unknown")
+        parts.append(f"[local] backend=semble, runner={runner}")
+
+    while parts and not parts[-1]:
+        parts.pop()
+    return "\n".join(parts)
+
+
+def _limit_semble_payload(payload: dict[str, Any], limit: int) -> dict[str, Any]:
+    limited = dict(payload)
+    limited["results"] = list(payload.get("results") or [])[:limit]
+    return limited
+
+
+def _format_semble_prompt_context(
+    payload: dict[str, Any],
+    max_chunks: int = 5,
+    max_chars: int = 5000,
+) -> str:
+    results = payload.get("results") or []
+    if not results:
+        return ""
+
+    lines = [
+        "Local Semble chunk candidates:",
+        "Use these local chunk hits as retrieval hints. Verify them with restricted tools before finalizing.",
+    ]
+    used = sum(len(line) + 1 for line in lines)
+    for item in results[:max_chunks]:
+        chunk = item.get("chunk") or {}
+        path = chunk.get("file_path") or ""
+        start = chunk.get("start_line")
+        end = chunk.get("end_line")
+        score = item.get("score")
+        score_text = f" score={float(score):.4f}" if isinstance(score, (int, float)) else ""
+        content = _truncate_display(chunk.get("content") or "", 900)
+        block = [
+            f"- /codebase/{path}:L{start}-{end}{score_text}",
+            f"  {content}",
+        ]
+        block_size = sum(len(line) + 1 for line in block)
+        if used + block_size > max_chars:
+            break
+        lines.extend(block)
+        used += block_size
+    return "\n".join(lines)
+
+
+def local_search_with_content(
+    query: str,
+    project_root: str,
+    max_results: int = 10,
+    content_types: list[str] | None = None,
+    verbose: bool = False,
+) -> str:
+    payload = semble_search(
+        query=query,
+        project_root=project_root,
+        top_k=max_results,
+        content=content_types,
+    )
+    return _format_semble_output(payload, project_root, verbose=verbose)
+
+
+def find_related_with_content(
+    file_path: str,
+    line: int,
+    project_root: str,
+    max_results: int = 10,
+    content_types: list[str] | None = None,
+    verbose: bool = False,
+) -> str:
+    payload = semble_find_related(
+        file_path=file_path,
+        line=line,
+        project_root=project_root,
+        top_k=max_results,
+        content=content_types,
+    )
+    return _format_semble_output(
+        payload,
+        project_root,
+        verbose=verbose,
+        heading=f"Related local Semble chunks for {file_path}:{line}:",
+    )
+
+
+def _format_error_result(
+    result: dict[str, Any],
+    max_turns: int,
+    max_results: int,
+    max_commands: int,
+    timeout_ms: int,
+) -> str:
+    message = f"Error: {result['error']}"
+    meta = result.get("_meta") or {}
+    if meta:
+        message += (
+            f"\n\n[diagnostic] tree_depth={meta.get('tree_depth')}, "
+            f"tree_size={meta.get('tree_size_kb')}KB"
+        )
+        if meta.get("model"):
+            message += f", model={meta['model']}"
+        attempts = meta.get("model_attempts") or []
+        if len(attempts) > 1:
+            message += f", model_attempts={' -> '.join(attempts)}"
+        if meta.get("fell_back"):
+            message += " (auto fell back)"
+        if meta.get("context_trimmed"):
+            message += ", context_trimmed=true"
+        if meta.get("error_code"):
+            message += f", error_type={meta['error_code']}"
+        message += (
+            f"\n[config] max_turns={max_turns}, max_results={max_results}, "
+            f"max_commands={max_commands}, timeout_ms={timeout_ms}"
+        )
+    if "AUTH_ERROR" in result["error"]:
+        message += "\n[hint] Windsurf 凭证可能已过期，重新提取后设置 WINDSURF_API_KEY 再试。"
+    elif "PAYLOAD_TOO_LARGE" in result["error"] or "TIMEOUT" in result["error"]:
+        message += "\n[hint] 尝试降低 tree_depth、缩小 project_root，或增加 exclude_paths。"
+    elif "resource_exhausted" in result["error"].lower():
+        message += "\n[hint] 已自动尝试备用模型；如果仍失败，可稍后重试或设置 WS_FALLBACK_MODELS 扩展候选链。"
+    return message
+
+
 def search_with_content(
     query: str,
     project_root: str,
@@ -1958,54 +2131,81 @@ def search_with_content(
     timeout_ms: int = 30000,
     exclude_paths: list[str] | None = None,
     verbose: bool = False,
+    backend: str = "hybrid",
+    content_types: list[str] | None = None,
 ) -> str:
     """搜索并返回适合 CLI / skill 的格式化结果。"""
-    result = search(
-        query=query, project_root=project_root,
-        api_key=api_key,
-        max_turns=max_turns,
-        max_commands=max_commands,
-        max_results=max_results,
-        tree_depth=tree_depth,
-        timeout_ms=timeout_ms,
-        exclude_paths=exclude_paths,
-    )
+    if backend not in {"hybrid", "auto", "remote", "local"}:
+        raise ValueError(f"unknown backend: {backend}")
+    if backend == "auto":
+        backend = "hybrid"
+
+    if backend == "local":
+        return local_search_with_content(
+            query=query,
+            project_root=project_root,
+            max_results=max_results,
+            content_types=content_types,
+            verbose=verbose,
+        )
+
+    local_payload: dict[str, Any] | None = None
+    local_context = ""
+    local_error = ""
+    if backend == "hybrid":
+        try:
+            local_payload = semble_search(
+                query=query,
+                project_root=project_root,
+                top_k=max_results,
+                content=content_types,
+            )
+            local_context = _format_semble_prompt_context(
+                local_payload,
+                max_chunks=min(max_results, 5),
+            )
+        except SembleUnavailable as exc:
+            local_error = str(exc)
+
+    try:
+        result = search(
+            query=query, project_root=project_root,
+            api_key=api_key,
+            max_turns=max_turns,
+            max_commands=max_commands,
+            max_results=max_results,
+            tree_depth=tree_depth,
+            timeout_ms=timeout_ms,
+            exclude_paths=exclude_paths,
+            local_context=local_context,
+        )
+    except Exception as exc:
+        if backend == "hybrid" and local_payload:
+            local_output = _format_semble_output(local_payload, project_root, verbose=verbose)
+            return f"Remote search unavailable: {exc}\nUsing local Semble results.\n\n{local_output}"
+        if backend == "hybrid" and local_error:
+            return f"Error: {exc}\n[local Semble unavailable] {local_error}"
+        return f"Error: {exc}"
 
     if result.get("error"):
-        message = f"Error: {result['error']}"
-        meta = result.get("_meta") or {}
-        if meta:
-            message += (
-                f"\n\n[diagnostic] tree_depth={meta.get('tree_depth')}, "
-                f"tree_size={meta.get('tree_size_kb')}KB"
-            )
-            if meta.get("model"):
-                message += f", model={meta['model']}"
-            attempts = meta.get("model_attempts") or []
-            if len(attempts) > 1:
-                message += f", model_attempts={' -> '.join(attempts)}"
-            if meta.get("fell_back"):
-                message += " (auto fell back)"
-            if meta.get("context_trimmed"):
-                message += ", context_trimmed=true"
-            if meta.get("error_code"):
-                message += f", error_type={meta['error_code']}"
-            message += (
-                f"\n[config] max_turns={max_turns}, max_results={max_results}, "
-                f"max_commands={max_commands}, timeout_ms={timeout_ms}"
-            )
-        if "AUTH_ERROR" in result["error"]:
-            message += "\n[hint] Windsurf 凭证可能已过期，重新提取后设置 WINDSURF_API_KEY 再试。"
-        elif "PAYLOAD_TOO_LARGE" in result["error"] or "TIMEOUT" in result["error"]:
-            message += "\n[hint] 尝试降低 tree_depth、缩小 project_root，或增加 exclude_paths。"
-        elif "resource_exhausted" in result["error"].lower():
-            message += "\n[hint] 已自动尝试备用模型；如果仍失败，可稍后重试或设置 WS_FALLBACK_MODELS 扩展候选链。"
-        return message
+        remote_error = _format_error_result(
+            result,
+            max_turns=max_turns,
+            max_results=max_results,
+            max_commands=max_commands,
+            timeout_ms=timeout_ms,
+        )
+        if backend == "hybrid" and local_payload:
+            local_output = _format_semble_output(local_payload, project_root, verbose=verbose)
+            return f"{remote_error}\n\nUsing local Semble results.\n\n{local_output}"
+        if backend == "hybrid" and local_error:
+            return f"{remote_error}\n[local Semble unavailable] {local_error}"
+        return remote_error
 
     files = result.get("files", [])
     rg_patterns = result.get("rg_patterns", [])
     meta = result.get("_meta") or {}
-    return _format_success_output(
+    remote_output = _format_success_output(
         files=files,
         query=query,
         rg_patterns=rg_patterns,
@@ -2018,6 +2218,17 @@ def search_with_content(
         exclude_paths=exclude_paths,
         verbose=verbose,
     )
+    if backend == "hybrid" and local_payload and (local_payload.get("results") or []):
+        local_output = _format_semble_output(
+            _limit_semble_payload(local_payload, min(max_results, 5)),
+            project_root,
+            verbose=verbose,
+            heading="Local Semble chunk candidates:",
+        )
+        return f"{remote_output}\n\n{local_output}"
+    if backend == "hybrid" and local_error and verbose:
+        return f"{remote_output}\n\n[local Semble unavailable] {local_error}"
+    return remote_output
 
 
 def extract_key_info() -> dict:

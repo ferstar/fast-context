@@ -83,6 +83,7 @@ class SearchOutputFormatTest(unittest.TestCase):
         result = core.search_with_content(
             query="where is search_with_content parsed and where is tool_info returned",
             project_root=str(self.project_root),
+            backend="remote",
         )
 
         self.assertIn("Start here:", result)
@@ -103,6 +104,7 @@ class SearchOutputFormatTest(unittest.TestCase):
             query="where is search_with_content parsed and where is tool_info returned",
             project_root=str(self.project_root),
             verbose=True,
+            backend="remote",
         )
 
         self.assertIn("anchor: def search_with_content(query: str) -> str:", result)

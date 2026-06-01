@@ -90,6 +90,28 @@ Refresh the lockfile after dependency or Python-version changes:
 uv lock --default-index https://pypi.org/simple
 ```
 
+## Prompt snippet for code agents
+
+Use this when your coding agent needs fast repo orientation before editing, review, or debugging:
+
+```text
+Use the installed `fast-context` skill for intent-based or open-ended codebase search when the exact path or symbol is not known yet.
+
+Run:
+python "$HOME/.agents/skills/fast-context/src/fast_context_cli.py" search \
+  --query "<natural language query>" \
+  --project "<repo-root>"
+
+Notes:
+- Prefer `fast-context` before `rg` for vague questions: debugging explorations, "where is X?", flow tracing, or feature-oriented repo navigation.
+- If the exact filename, path, or symbol is already known, use `rg` or open the file directly instead of starting with `fast-context`.
+- Treat `fast-context` as a candidate-file generator, not a proof source. After it returns results, read the relevant files and use exact search only to confirm names, events, tests, or call sites.
+- Split unrelated questions into separate `fast-context` queries. Long natural-language queries are fine when they describe one workflow, but multi-topic queries can drop weaker subtopics.
+- Do not treat "results found" as evidence that a feature exists. For negative or fictional queries, `fast-context` may still return approximate matches; verify existence from the code before concluding.
+- Prefer queries that describe behavior and data flow, not just nouns: include user action, runtime boundary, expected effect, and any known payload fields.
+- If remote Windsurf search fails, use the returned local Semble results to keep moving.
+```
+
 ## CLI
 
 ### Search

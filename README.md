@@ -1,5 +1,7 @@
 # Fast Context Skill
 
+[中文说明](README.zh-CN.md)
+
 Python-first fast repository context search for Codex/Claude-style skills.
 
 This repo replaces the Node/MCP packaging with a simple Python CLI and skill workflow. It still talks to Windsurf's reverse-engineered SWE-grep backend, but now keeps the local side lean:

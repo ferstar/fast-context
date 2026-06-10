@@ -9,7 +9,7 @@ This repo replaces the Node/MCP packaging with a simple Python CLI and skill wor
 - local Semble prefetch for cached chunk candidates
 - local Windsurf credential extraction from `state.vscdb`
 - local lexical anchors before the remote semantic loop
-- adaptive repo-map depth to avoid oversized payloads
+- BM25F directory heat, adaptive topK, and hotspot repo maps to avoid oversized payloads
 - skill-friendly output with candidate files, line ranges, and follow-up grep terms
 
 ## Why this shape
@@ -18,7 +18,7 @@ The high-ROI path for code search is not prompt tricks. It is a hybrid retrieval
 
 1. Run Semble locally first to get warm-cache chunk candidates.
 2. Keep exact lexical evidence from the local repo: filenames, paths, literal terms.
-3. Give Semble candidates, lexical evidence, and a compact repo map to the remote semantic search loop.
+3. Give Semble candidates, lexical evidence, and a hotspot repo map to the remote semantic search loop.
 4. Let Windsurf verify and expand with `rg`, `readfile`, `tree`, `ls`, and `glob` calls.
 5. If the remote path is unavailable, degrade to local Semble chunk retrieval.
 6. Return a small set of files or chunks that are actually worth reading next.
@@ -32,7 +32,7 @@ User query
   -> Semble local prefetch
      -> cached index + potion-code-16M chunks
   -> fast-context prompt
-     -> original query + Semble chunk hints + lexical anchors + repo map
+     -> original query + Semble chunk hints + lexical anchors + hotspot repo map
   -> Windsurf remote search
      -> verify hints with rg/readfile/tree/ls/glob and expand related files
   -> Start here output
@@ -42,6 +42,27 @@ Remote failure path:
   Windsurf auth/rate-limit/timeout/resource_exhausted
     -> return local Semble chunk results instead of an empty failure
 ```
+
+## Hotspot repo maps
+
+Large repos make naive deep trees expensive and noisy. Fast Context now sends the remote semantic loop a query-shaped repo map instead of only a fixed compact tree.
+
+The map has three layers:
+
+- `Repository Map`: a compact top-level tree so the model keeps global orientation.
+- `Relevant File Paths`: exact file paths recovered from lexical probes, kept first when the payload must shrink.
+- `Hotspot Subtrees`: BM25F-ranked directories expanded with adaptive `topK`, so likely feature areas get more detail than cold directories.
+
+This is used by `search` for the `hybrid` and `remote` backends. The `local` backend does not need it because it returns Semble chunk hits directly. If repo-map construction fails or the budget is too tight, Fast Context falls back to the classic compact tree.
+
+On a private 16-query large-repo A/B suite, the optimized map traded roughly `10 ms -> 120 ms` repo-map build p50 and `2.4 KB -> 11.9 KB` payload size for much better exact-file visibility:
+
+| Variant | File recall | Deep directory coverage | File MRR | p50 build latency | Avg map size |
+|---|---:|---:|---:|---:|---:|
+| `classic` | 0.0000 | 1.0000 | 0.0000 | 10 ms | 2.4 KB |
+| `hotspot` | 0.4792 | 1.0000 | 0.0184 | 120 ms | 11.9 KB |
+
+The read is straightforward: classic maps are cheaper and preserve broad directory coverage, but they often hide exact files in day-to-day feature queries. Hotspot maps cost more local preprocessing and a larger prompt section, but they expose concrete candidate files before the remote loop starts verifying.
 
 ## Files
 
@@ -57,6 +78,7 @@ fast-context/
 ├── src/
 │   ├── core.py               # Protocol, search loop, repo map, local lexical anchors
 │   ├── extract_key.py        # Windsurf credential extraction from state.vscdb
+│   ├── local_repo_map.py     # BM25F directory heat, adaptive topK, path spines
 │   ├── local_semble.py       # Local Semble adapter
 │   └── fast_context_cli.py   # CLI entrypoint for the skill
 ├── SKILL.md              # Skill instructions
@@ -283,6 +305,42 @@ Artifacts from the run:
 
 ![Retrieval benchmark speed vs quality](assets/images/retrieval_benchmark_speed_vs_quality.svg)
 
+### Repo-map A/B
+
+Use [`benchmarks/run_repo_map_ab.py`](benchmarks/run_repo_map_ab.py) when tuning repo-map behavior. It compares the classic compact tree against the hotspot map without making remote Windsurf calls, so it is deterministic and safe to run on private repos.
+
+Prepare a task JSON outside the repo when labels or paths are sensitive:
+
+```json
+[
+  {
+    "category": "desktop-feature",
+    "query": "where is feature setup validated and persisted",
+    "relevant_paths": [
+      "apps/desktop/src/lib/feature-store.ts",
+      "apps/desktop/electron/ipc/feature.ts"
+    ]
+  }
+]
+```
+
+Run it with a redacted repo label:
+
+```bash
+uv run python -m benchmarks.run_repo_map_ab \
+  --repo /path/to/repo \
+  --tasks /path/to/repo-map-tasks.json \
+  --repo-label private-large-repo \
+  --output /tmp/repo-map-ab.json
+```
+
+The main metrics are:
+
+- `file_recall`: exact labeled files visible in the map.
+- `deep_cover_recall`: labeled files covered by a directory at depth two or deeper.
+- `file_mrr` / `deep_cover_mrr`: how early the first exact file or covering directory appears.
+- `avg_size_bytes` and `p50_latency_ms`: prompt and local preprocessing cost.
+
 ### Important note on fairness
 
 The `2026-06-01` numbers below were collected before the runner switched to completion-based cooldown. That older runner only enforced a start-gap, which meant any `~5s` remote call effectively launched the next one immediately after completion and could over-stress Windsurf during long batches. Treat the published `remote` / `hybrid` rows as an operational stress run, not the final apples-to-apples backend comparison.
@@ -344,7 +402,7 @@ Typical flow:
 ## Notes
 
 - Local lexical anchors are generic. They bias toward exact filenames, path segments, and literal content hits from the query.
-- Repo maps shrink automatically when the tree gets too large.
+- Repo maps now start with a compact top-level tree, then add relevant file paths and BM25F-ranked hotspot subtrees. If the map is still too large, it keeps file paths first, trims hotspot subtrees, trims path spines only if needed, and finally falls back to the classic compact tree.
 - If the remote call times out or the payload is too large, the search loop trims old context and retries once.
 - Fast Context calls the Semble Python library directly, saves fresh local indexes into Semble's cache, and lets Semble invalidate that cache when indexed files change.
 - Semble chunk hits are candidate evidence, not proof. Hybrid mode asks Windsurf to verify them before producing the main `Start here` output.

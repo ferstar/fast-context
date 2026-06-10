@@ -112,5 +112,6 @@ uv run --project "$SKILL_DIR" fast-context cache-clear --project "<repo-root>"
 
 - `src/fast_context_cli.py`: CLI entry used by this skill
 - `src/core.py`: protocol, auth, repo-map logic, local lexical anchors
+- `src/local_repo_map.py`: BM25F directory heat, adaptive topK, hotspot subtrees, path spines
 - `src/local_semble.py`: local Semble search adapter
 - `src/extract_key.py`: Windsurf credential extraction

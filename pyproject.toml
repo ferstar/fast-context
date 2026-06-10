@@ -18,4 +18,4 @@ fast-context = "fast_context_cli:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}
-py-modules = ["core", "extract_key", "fast_context_cli", "local_semble"]
+py-modules = ["core", "extract_key", "fast_context_cli", "local_repo_map", "local_semble"]

@@ -9,7 +9,7 @@
 - 本地 Semble 先捞缓存的 chunk 候选
 - 从 `state.vscdb` 把 Windsurf 凭据提出来
 - 发给远端做语义搜索之前，先补上本地 lexical anchors
-- repo map 太大时自动压缩，别让 payload 撑爆
+- 用 BM25F 目录热度、adaptive topK 和 hotspot repo map 控制 payload
 - 输出更适合 skill 接的候选文件、行号范围和后续 grep 关键词
 
 ## 为什么这么设计
@@ -18,7 +18,7 @@
 
 1. 本地先用 Semble 跑一圈，拿到热缓存的 chunk 候选。
 2. 同时把仓库里精确的词法线索也留着：文件名、路径、字面量关键词。
-3. 把 Semble 候选、词法线索、紧凑的 repo map 一起丢给远端做语义搜索。
+3. 把 Semble 候选、词法线索、hotspot repo map 一起丢给远端做语义搜索。
 4. Windsurf 用 `rg`、`readfile`、`tree`、`ls`、`glob` 验证并扩展相关文件。
 5. 远端走不通就降级到本地 Semble chunk 检索，至少不空手。
 6. 最后只给一小组真正值得读的文件或 chunk。
@@ -32,7 +32,7 @@
   -> 本地 Semble 预取
      -> 缓存索引 + potion-code-16M chunks
   -> fast-context prompt
-     -> 原始查询 + Semble chunk 提示 + lexical anchors + repo map
+     -> 原始查询 + Semble chunk 提示 + lexical anchors + hotspot repo map
   -> Windsurf 远端搜索
      -> 用 rg/readfile/tree/ls/glob 验证提示并扩展相关文件
   -> Start here 输出
@@ -42,6 +42,27 @@
   Windsurf auth/rate-limit/timeout/resource_exhausted
     -> 返回本地 Semble 结果，至少不空手
 ```
+
+## Hotspot repo map
+
+大仓库里直接塞一棵深目录树，成本高，而且噪音多。Fast Context 现在给远端语义搜索环节的是一份跟当前 query 相关的 repo map，而不是只给固定的 compact tree。
+
+这份 map 分三层：
+
+- `Repository Map`：紧凑的顶层目录树，保留全局结构感。
+- `Relevant File Paths`：本地 lexical probe 找到的精确文件路径；payload 需要收缩时优先保留。
+- `Hotspot Subtrees`：用 BM25F 排出来的热点目录，再按 adaptive `topK` 展开，让更可能相关的功能区拿到更多细节。
+
+这个逻辑默认用于 `search` 的 `hybrid` 和 `remote` backend。`local` backend 直接返回 Semble chunk，不需要 repo map。构建失败或者预算太紧时，会自动回退到 classic compact tree。
+
+在一套私有的大仓 16-query A/B 里，优化后的 map 把 repo-map 构建 p50 从约 `10 ms` 提到 `120 ms`，payload 从 `2.4 KB` 提到 `11.9 KB`，换来的是更好的精确文件可见性：
+
+| Variant | File recall | Deep directory coverage | File MRR | p50 build latency | Avg map size |
+|---|---:|---:|---:|---:|---:|
+| `classic` | 0.0000 | 1.0000 | 0.0000 | 10 ms | 2.4 KB |
+| `hotspot` | 0.4792 | 1.0000 | 0.0184 | 120 ms | 11.9 KB |
+
+解读也很直接：classic map 更便宜，广义目录覆盖还在，但日常功能查询经常看不到具体文件。Hotspot map 多花一点本地预处理和 prompt 预算，换来的是远端开始验证前就能看到更多具体候选文件。
 
 ## 文件结构
 
@@ -57,6 +78,7 @@ fast-context/
 ├── src/
 │   ├── core.py               # 协议、搜索循环、repo map、本地 lexical anchors
 │   ├── extract_key.py        # 从 state.vscdb 提取 Windsurf 凭据
+│   ├── local_repo_map.py     # BM25F 目录热度、adaptive topK、path spines
 │   ├── local_semble.py       # 本地 Semble 适配层
 │   └── fast_context_cli.py   # CLI 入口
 ├── SKILL.md                  # Skill 说明
@@ -283,6 +305,42 @@ benchmark 脚本默认会去找兄弟目录下的 `../semble/benchmarks` checkou
 
 ![Retrieval benchmark speed vs quality](assets/images/retrieval_benchmark_speed_vs_quality.svg)
 
+### Repo-map A/B
+
+调 repo-map 行为时，用 [`benchmarks/run_repo_map_ab.py`](benchmarks/run_repo_map_ab.py)。它只比较 classic compact tree 和 hotspot map，不调用远端 Windsurf，所以结果是确定性的，也适合在私有 repo 上跑。
+
+如果标签或路径敏感，把 task JSON 放在仓库外面：
+
+```json
+[
+  {
+    "category": "desktop-feature",
+    "query": "where is feature setup validated and persisted",
+    "relevant_paths": [
+      "apps/desktop/src/lib/feature-store.ts",
+      "apps/desktop/electron/ipc/feature.ts"
+    ]
+  }
+]
+```
+
+运行时带一个脱敏 repo label：
+
+```bash
+uv run python -m benchmarks.run_repo_map_ab \
+  --repo /path/to/repo \
+  --tasks /path/to/repo-map-tasks.json \
+  --repo-label private-large-repo \
+  --output /tmp/repo-map-ab.json
+```
+
+主要看这些指标：
+
+- `file_recall`：map 里能看到多少标注的精确文件。
+- `deep_cover_recall`：标注文件是否被二级或更深的目录覆盖。
+- `file_mrr` / `deep_cover_mrr`：第一个精确文件或覆盖目录出现得有多早。
+- `avg_size_bytes` 和 `p50_latency_ms`：prompt 成本和本地预处理成本。
+
 ### 关于公平性的说明
 
 下面这些 `2026-06-01` 的数字，是在 runner 切换成 completion-based cooldown 之前跑出来的。旧 runner 只卡请求启动间隔，意味着差不多 `~5s` 的 remote 调用跑完后，几乎立刻就会发出下一次请求——长批次下来很容易把 Windsurf 压炸。所以已经发出去的 `remote` / `hybrid` 数据更像一次压力测试，离公平的 backend 一对一对比还有距离。
@@ -344,7 +402,7 @@ benchmark 脚本默认会去找兄弟目录下的 `../semble/benchmarks` checkou
 ## 备注
 
 - 本地 lexical anchors 是通用启发式规则，偏向精确的文件名、路径片段和查询中的字面量命中。
-- repo tree 太大的时候，repo map 会自动缩。
+- repo map 现在先给紧凑的顶层树，再追加相关文件路径和 BM25F 排出来的热点子树。如果还是太大，会优先保留文件路径，先收缩热点子树，必要时再丢 path spines，最后才回退到 classic compact tree。
 - 远端请求超时或者 payload 太大时，搜索循环会裁掉旧上下文再重试一次。
 - Fast Context 直接调 Semble Python library，新建的本地索引会存回 Semble 缓存，Semble 自己会在索引文件变化时自动判断要不要失效。
 - Semble chunk 命中只是候选，不能当最终证据。Hybrid 模式会先让 Windsurf 验证，再生成主 `Start here` 输出。

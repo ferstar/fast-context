@@ -73,6 +73,9 @@ class SearchOutputFormatTest(unittest.TestCase):
                 "tree_depth": 3,
                 "tree_size_kb": 0.5,
                 "fell_back": True,
+                "repo_map_strategy": "bootstrap_hotspot",
+                "hot_dirs": ["src"],
+                "path_spines": ["src/core.py"],
             },
         }
 
@@ -110,6 +113,9 @@ class SearchOutputFormatTest(unittest.TestCase):
         self.assertIn("anchor: def search_with_content(query: str) -> str:", result)
         self.assertIn("[config] tree_depth=3, tree_size=0.5KB", result)
         self.assertIn("fell back from requested depth", result)
+        self.assertIn("repo_map_strategy=bootstrap_hotspot", result)
+        self.assertIn("hot_dirs=[src]", result)
+        self.assertIn("path_spines=1", result)
 
 
 if __name__ == "__main__":

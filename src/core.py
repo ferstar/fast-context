@@ -34,6 +34,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
+from local_repo_map import build_classic_repo_map, build_optimized_repo_map
 from local_semble import SembleUnavailable, find_related as semble_find_related, search as semble_search
 
 
@@ -199,6 +200,9 @@ DEFAULT_EXCLUDE_PATTERNS = [
     "third_party",
     "logs",
     "data",
+    ".ast-bro",
+    ".DS_Store",
+    "*.egg-info",
 ]
 
 QUERY_STOPWORDS = {
@@ -1457,24 +1461,36 @@ def get_repo_map(
     exclude_paths: list[str] | None = None,
 ) -> tuple[str, int, int, bool]:
     excludes = _effective_excludes(exclude_paths)
-    safe_depth = max(1, min(target_depth, 6))
+    result = build_classic_repo_map(project_root, target_depth, excludes, MAX_TREE_BYTES)
+    return result["tree"], result["depth"], result["size_bytes"], result["fell_back"]
 
-    for depth in range(safe_depth, 0, -1):
-        tree = _render_repo_tree(project_root, depth, excludes)
-        size_bytes = len(tree.encode("utf-8"))
-        if size_bytes <= MAX_TREE_BYTES:
-            return tree, depth, size_bytes, depth < safe_depth
 
+def _get_repo_map_with_meta(
+    project_root: str,
+    query: str,
+    target_depth: int = 3,
+    exclude_paths: list[str] | None = None,
+) -> tuple[str, int, int, bool, dict[str, Any]]:
+    excludes = _effective_excludes(exclude_paths)
     try:
-        entries = sorted(
-            entry for entry in os.listdir(project_root)
-            if not _is_excluded_path(entry, excludes)
+        result = build_optimized_repo_map(
+            project_root=project_root,
+            query=query,
+            target_depth=target_depth,
+            exclude_paths=excludes,
+            max_bytes=MAX_TREE_BYTES,
         )
-    except (OSError, PermissionError):
-        return "/codebase\n(empty or inaccessible)", 0, 28, True
+    except Exception:
+        tree, depth, size_bytes, fell_back = get_repo_map(project_root, target_depth, exclude_paths)
+        return tree, depth, size_bytes, fell_back, {"repo_map_strategy": "classic_fallback"}
 
-    tree = "\n".join(["/codebase"] + [f"├── {entry}" for entry in entries[:200]])
-    return tree, 0, len(tree.encode("utf-8")), True
+    meta = {
+        "repo_map_strategy": result.get("strategy"),
+        "hot_dirs": result.get("hot_dirs") or [],
+        "path_spines": result.get("path_spines") or [],
+        "repo_map_signals": result.get("signals") or {},
+    }
+    return result["tree"], result["depth"], result["size_bytes"], result["fell_back"], meta
 
 
 def _search_once(
@@ -1491,6 +1507,7 @@ def _search_once(
     actual_depth: int,
     tree_size_bytes: int,
     fell_back: bool,
+    repo_map_meta: dict[str, Any] | None = None,
     on_progress: Callable[[str], None] | None = None,
 ) -> Dict[str, Any]:
     def log(msg: str) -> None:
@@ -1505,6 +1522,8 @@ def _search_once(
             "project_root": project_root,
             "model": model,
         }
+        if repo_map_meta:
+            meta.update(repo_map_meta)
         meta.update(extra)
         return meta
 
@@ -1650,15 +1669,19 @@ def search(
     tool_defs = get_tool_definitions(max_commands)
     system_prompt = build_system_prompt(max_turns, max_commands, max_results)
 
-    repo_map, actual_depth, tree_size_bytes, fell_back = get_repo_map(
+    repo_map, actual_depth, tree_size_bytes, fell_back, repo_map_meta = _get_repo_map_with_meta(
         project_root,
+        query,
         tree_depth,
         exclude_paths,
     )
+    hot_dirs = repo_map_meta.get("hot_dirs") or []
     log(
         f"Repo map: tree -L {actual_depth} "
         f"({tree_size_bytes / 1024:.1f}KB)"
         f"{' [fell back]' if fell_back else ''}"
+        f" [strategy={repo_map_meta.get('repo_map_strategy')}]"
+        f"{f' [hot={','.join(hot_dirs)}]' if hot_dirs else ''}"
     )
     local_anchor_brief = build_local_anchor_brief(
         query,
@@ -1693,6 +1716,7 @@ def search(
                         "fell_back": fell_back,
                         "project_root": project_root,
                         "error_code": "RATE_LIMITED",
+                        **repo_map_meta,
                     },
                 }
             else:
@@ -1710,6 +1734,7 @@ def search(
                     actual_depth=actual_depth,
                     tree_size_bytes=tree_size_bytes,
                     fell_back=fell_back,
+                    repo_map_meta=repo_map_meta,
                     on_progress=on_progress,
                 )
 
@@ -1752,6 +1777,7 @@ def search(
             "tree_size_kb": round(tree_size_bytes / 1024, 1),
             "fell_back": fell_back,
             "project_root": project_root,
+            **repo_map_meta,
         },
     }
 
@@ -1993,6 +2019,14 @@ def _format_success_output(
             config_line += f", model_attempts={' -> '.join(attempts)}"
         if meta.get("fell_back"):
             config_line += " (fell back from requested depth)"
+        if meta.get("repo_map_strategy"):
+            config_line += f", repo_map_strategy={meta['repo_map_strategy']}"
+        hot_dirs = meta.get("hot_dirs") or []
+        if hot_dirs:
+            config_line += f", hot_dirs=[{', '.join(hot_dirs[:6])}]"
+        path_spines = meta.get("path_spines") or []
+        if path_spines:
+            config_line += f", path_spines={len(path_spines)}"
         if exclude_paths:
             config_line += f", exclude_paths=[{', '.join(exclude_paths)}]"
         parts.append(config_line)

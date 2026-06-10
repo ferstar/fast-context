@@ -81,13 +81,14 @@ uv run --project "$SKILL_DIR" fast-context search \
 ## Authentication
 
 - The CLI first checks `WINDSURF_API_KEY`.
-- If that is unset, it reads Windsurf's local `state.vscdb`.
-- That auto-discovery only works on the same machine where Windsurf is installed.
-- Current Windsurf installs may store session-style credentials such as `devin-session-token$...`; this skill accepts them directly.
-- If Windsurf lives on another host, copy the database locally and run:
+- If that is unset, it reads Devin CLI credentials on Linux/WSL, then local `Deviv`, `Devin`, and `Windsurf` `state.vscdb` files.
+- That auto-discovery only works on the same machine where Windsurf/Devin is installed or where `devin login` has been run.
+- Current installs may store session-style credentials such as `devin-session-token$...`; this skill accepts them directly.
+- If Windsurf/Devin lives on another host, copy the database or credentials file locally and run:
 
 ```bash
 uv run --project "$SKILL_DIR" fast-context extract-key --db-path "<copied-state.vscdb>"
+uv run --project "$SKILL_DIR" fast-context extract-key --db-path "<copied-credentials.toml>"
 ```
 
 ## Cache maintenance

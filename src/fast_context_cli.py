@@ -82,8 +82,8 @@ def _build_parser() -> argparse.ArgumentParser:
     related_parser.add_argument("--verbose", action="store_true", help="Show local backend diagnostics.")
     _add_local_content_args(related_parser)
 
-    extract_parser = subparsers.add_parser("extract-key", help="Extract Windsurf credential")
-    extract_parser.add_argument("--db-path", help="Path to a copied state.vscdb")
+    extract_parser = subparsers.add_parser("extract-key", help="Extract Windsurf/Devin credential")
+    extract_parser.add_argument("--db-path", help="Path to a copied state.vscdb or credentials.toml")
 
     cache_clear_parser = subparsers.add_parser("cache-clear", help="Clear Semble cache for a project")
     cache_clear_parser.add_argument("--project", default=".", help="Project root directory")

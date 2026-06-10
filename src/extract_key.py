@@ -1,56 +1,142 @@
 #!/usr/bin/env python3
 """
-Windsurf API Key 提取工具（跨平台：macOS / Windows / Linux）
+Windsurf/Devin API Key 提取工具（跨平台：macOS / Windows / Linux）
 
-从 Windsurf 本地安装中提取 API Key，无需额外依赖。
+从 Windsurf/Devin 本地安装中提取 API Key，无需额外依赖。
 
 用法:
   python src/extract_key.py                    # 自动检测平台并提取
   python src/extract_key.py --json             # JSON 格式输出
   python src/extract_key.py --db-path /tmp/state.vscdb
+  python src/extract_key.py --db-path ~/.local/share/devin/credentials.toml
 """
 
 import json
 import os
 import platform
+import re
 import sqlite3
 import sys
 from pathlib import Path
 
 
-def get_db_path() -> Path:
-    """获取 Windsurf state.vscdb 路径（跨平台）。"""
-    system = platform.system()
+TOML_API_KEY_FIELDS = (
+    "api_key",
+    "apiKey",
+    "devin_api_key",
+    "devinApiKey",
+    "windsurf_api_key",
+    "windsurfApiKey",
+    "access_token",
+    "accessToken",
+    "token",
+)
+
+
+def get_db_path_candidates(
+    system: str | None = None,
+    home: Path | None = None,
+    env: dict[str, str] | None = None,
+) -> list[Path]:
+    """获取 Windsurf/Devin state.vscdb 候选路径（跨平台）。"""
+    system = system or platform.system()
+    home = home or Path.home()
+    env = env or os.environ
+    app_names = ("Deviv", "Devin", "Windsurf")
 
     if system == "Darwin":  # macOS
-        return Path.home() / "Library" / "Application Support" / "Windsurf" / "User" / "globalStorage" / "state.vscdb"
-    elif system == "Windows":
-        appdata = os.environ.get("APPDATA", "")
+        return [
+            home / "Library" / "Application Support" / app_name / "User" / "globalStorage" / "state.vscdb"
+            for app_name in app_names
+        ]
+    if system == "Windows":
+        appdata = env.get("APPDATA", "")
         if not appdata:
             raise RuntimeError("无法获取 APPDATA 环境变量")
-        return Path(appdata) / "Windsurf" / "User" / "globalStorage" / "state.vscdb"
-    else:  # Linux
-        config = os.environ.get("XDG_CONFIG_HOME", str(Path.home() / ".config"))
-        return Path(config) / "Windsurf" / "User" / "globalStorage" / "state.vscdb"
+        return [Path(appdata) / app_name / "User" / "globalStorage" / "state.vscdb" for app_name in app_names]
+
+    config = env.get("XDG_CONFIG_HOME", str(home / ".config"))
+    return [Path(config) / app_name / "User" / "globalStorage" / "state.vscdb" for app_name in app_names]
 
 
-def extract_key(db_path: str | Path | None = None) -> dict:
-    """
-    从 Windsurf state.vscdb 提取 API Key。
+def get_db_path() -> Path:
+    """获取首选 Windsurf/Devin state.vscdb 路径（跨平台）。"""
+    return get_db_path_candidates()[0]
 
-    Returns:
-        {"api_key": "...", "db_path": "/path/to/state.vscdb"}
-        或 {"error": "..."}
-    """
-    if db_path is None:
-        db_path = get_db_path()
-    else:
-        db_path = Path(db_path)
 
+def get_cli_credential_path_candidates(
+    system: str | None = None,
+    home: Path | None = None,
+) -> list[Path]:
+    """获取 Devin CLI credentials.toml 候选路径。WSL/Linux 优先读这里。"""
+    system = system or platform.system()
+    home = home or Path.home()
+    if system != "Linux":
+        return []
+    return [home / ".local" / "share" / "devin" / "credentials.toml"]
+
+
+def get_credential_sources() -> list[dict[str, Path | str]]:
+    toml_sources = [{"type": "toml", "path": path} for path in get_cli_credential_path_candidates()]
+    sqlite_sources = [{"type": "sqlite", "path": path} for path in get_db_path_candidates()]
+    return [*toml_sources, *sqlite_sources]
+
+
+def extract_api_key_from_toml(text: str) -> str:
+    """从 Devin CLI credentials.toml 内容中提取 API key。"""
+    for field in TOML_API_KEY_FIELDS:
+        match = re.search(rf"^\s*{field}\s*=\s*(?:\"([^\"]+)\"|'([^']+)'|([^\s#]+))", text, re.MULTILINE)
+        if not match:
+            continue
+        value = (match.group(1) or match.group(2) or match.group(3) or "").strip()
+        if value:
+            return value
+
+    fallback = re.search(r"\bsk-[A-Za-z0-9_-]+\b", text)
+    return fallback.group(0) if fallback else ""
+
+
+def extract_key_from_toml(credentials_path: str | Path) -> dict:
+    credentials_path = Path(credentials_path)
+    if not credentials_path.exists():
+        return {
+            "error": f"Devin CLI credentials 未找到: {credentials_path}",
+            "hint": "请先在 WSL/Linux 中运行 devin login。",
+            "db_path": str(credentials_path),
+            "source_type": "devin_cli_credentials",
+        }
+
+    try:
+        text = credentials_path.read_text(encoding="utf-8")
+    except Exception as e:
+        return {
+            "error": f"读取 Devin CLI credentials 失败: {e}",
+            "db_path": str(credentials_path),
+            "source_type": "devin_cli_credentials",
+        }
+
+    api_key = extract_api_key_from_toml(text)
+    if not api_key:
+        return {
+            "error": "Devin CLI credentials 中未找到 API key",
+            "hint": "请先在 WSL/Linux 中运行 devin login。",
+            "db_path": str(credentials_path),
+            "source_type": "devin_cli_credentials",
+        }
+
+    return {
+        "api_key": api_key,
+        "db_path": str(credentials_path),
+        "source_type": "devin_cli_credentials",
+    }
+
+
+def extract_key_from_db(db_path: str | Path) -> dict:
+    db_path = Path(db_path)
     if not db_path.exists():
         return {
-            "error": f"Windsurf 数据库未找到: {db_path}",
-            "hint": "请确保 Windsurf 已安装并登录。",
+            "error": f"Windsurf/Devin 数据库未找到: {db_path}",
+            "hint": "请确保 Windsurf 或 Devin 已安装并登录。",
             "db_path": str(db_path),
         }
 
@@ -66,7 +152,7 @@ def extract_key(db_path: str | Path | None = None) -> dict:
     if not row:
         return {
             "error": "未找到 windsurfAuthStatus 记录",
-            "hint": "请确保 Windsurf 已登录。",
+            "hint": "请确保 Windsurf 或 Devin 已登录。",
             "db_path": str(db_path),
         }
 
@@ -79,7 +165,48 @@ def extract_key(db_path: str | Path | None = None) -> dict:
     if not api_key:
         return {"error": "apiKey 字段为空", "db_path": str(db_path)}
 
-    return {"api_key": api_key, "db_path": str(db_path)}
+    return {"api_key": api_key, "db_path": str(db_path), "source_type": "sqlite"}
+
+
+def extract_key(db_path: str | Path | None = None) -> dict:
+    """
+    从 Devin CLI credentials.toml 或 Windsurf/Devin state.vscdb 提取 API Key。
+
+    Returns:
+        {"api_key": "...", "db_path": "/path/to/source", "source_type": "..."}
+        或 {"error": "..."}
+    """
+    if db_path is not None:
+        db_path = Path(db_path).expanduser()
+        if db_path.suffix == ".toml":
+            return extract_key_from_toml(db_path)
+        return extract_key_from_db(db_path)
+
+    sources = get_credential_sources()
+    tried_paths: list[str] = []
+    first_existing_error: dict | None = None
+
+    for source in sources:
+        source_path = Path(source["path"])
+        tried_paths.append(str(source_path))
+        if not source_path.exists():
+            continue
+
+        result = extract_key_from_toml(source_path) if source["type"] == "toml" else extract_key_from_db(source_path)
+        if "api_key" in result:
+            return result
+        if first_existing_error is None:
+            first_existing_error = result
+
+    if first_existing_error is not None:
+        return {**first_existing_error, "tried_paths": tried_paths}
+
+    return {
+        "error": "未找到 Windsurf/Devin 凭据来源",
+        "hint": "请确保 Devin 或 Windsurf 已安装并登录。",
+        "db_path": tried_paths[0] if tried_paths else "",
+        "tried_paths": tried_paths,
+    }
 
 def _parse_db_path(argv: list[str]) -> Path | None:
     if "--db-path" not in argv:
@@ -114,13 +241,15 @@ def main() -> int:
         print(json.dumps(result, ensure_ascii=False, indent=2))
         return 0
 
-    print(f"[OK] Windsurf API Key 提取成功")
-    print(f"")
+    print("[OK] Windsurf/Devin API Key 提取成功")
+    print()
     fmt = api_key.split("$", 1)[0] if "$" in api_key else "api-key"
     print(f"  Format: {fmt}")
     print(f"  Key: {api_key}")
     print(f"  Length: {len(api_key)} 字符")
     print(f"  Source: {result['db_path']}")
+    if result.get("source_type"):
+        print(f"  Source type: {result['source_type']}")
     print()
 
     system = platform.system()

@@ -203,7 +203,7 @@ Preview without deleting:
 uv run fast-context cache-gc --dry-run
 ```
 
-### Extract Windsurf credential
+### Extract Windsurf/Devin credential
 
 Local install:
 
@@ -211,13 +211,14 @@ Local install:
 uv run fast-context extract-key
 ```
 
-Copied database file:
+Copied database or Devin CLI credentials file:
 
 ```bash
 uv run fast-context extract-key --db-path /tmp/state.vscdb
+uv run fast-context extract-key --db-path ~/.local/share/devin/credentials.toml
 ```
 
-Current Windsurf installs may store either classic API keys or session-style credentials such as `devin-session-token$...`. This repo accepts either form as long as Windsurf accepts it.
+Auto-discovery checks Devin CLI credentials on Linux/WSL first, then local app databases under `Deviv`, `Devin`, and `Windsurf` app data paths. Current installs may store either classic API keys or session-style credentials such as `devin-session-token$...`. This repo accepts either form as long as Windsurf/Devin accepts it.
 
 ## Environment
 

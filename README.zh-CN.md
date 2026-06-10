@@ -203,7 +203,7 @@ uv run fast-context cache-gc
 uv run fast-context cache-gc --dry-run
 ```
 
-### 提取 Windsurf 凭据
+### 提取 Windsurf/Devin 凭据
 
 本机直接提取：
 
@@ -211,13 +211,14 @@ uv run fast-context cache-gc --dry-run
 uv run fast-context extract-key
 ```
 
-从复制出来的数据库文件提取：
+从复制出来的数据库文件或 Devin CLI credentials 提取：
 
 ```bash
 uv run fast-context extract-key --db-path /tmp/state.vscdb
+uv run fast-context extract-key --db-path ~/.local/share/devin/credentials.toml
 ```
 
-当前 Windsurf 安装里，凭据可能是传统 API key，也可能是 `devin-session-token$...` 这种 session 风格 token。只要 Windsurf 自己接受，这个仓库也会直接接受。
+自动发现会先检查 Linux/WSL 下的 Devin CLI credentials，然后再找 `Deviv`、`Devin`、`Windsurf` 本地 app 数据库。当前安装里，凭据可能是传统 API key，也可能是 `devin-session-token$...` 这种 session 风格 token。只要 Windsurf/Devin 自己接受，这个仓库也会直接接受。
 
 ## 环境变量
 

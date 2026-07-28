@@ -20,6 +20,19 @@ class ModelFallbackTest(unittest.TestCase):
     def tearDown(self) -> None:
         self.temp_dir.cleanup()
 
+    @patch("core.time.sleep")
+    def test_backoff_grows_exponentially_and_caps(self, mock_sleep) -> None:
+        delays = [
+            core._sleep_with_backoff(1000, 5000, attempt)
+            for attempt in range(1, 5)
+        ]
+
+        self.assertEqual(delays, [1000, 2000, 4000, 5000])
+        self.assertEqual(
+            [call.args[0] for call in mock_sleep.call_args_list],
+            [1.0, 2.0, 4.0, 5.0],
+        )
+
     @patch("core._search_once")
     @patch("core.check_rate_limit")
     @patch("core.time.sleep")

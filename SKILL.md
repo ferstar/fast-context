@@ -59,6 +59,7 @@ uv run --project "$SKILL_DIR" fast-context find-related \
 
 - Start with defaults.
 - Default `search` uses `--backend hybrid`: Semble prefetch first, Windsurf verification second, local results as degradation if remote fails.
+- Remote Windsurf sessions are serialized across local agents/processes with an OS-level file lock; local Semble and repo-map work remain concurrent.
 - Use `--backend remote` when you need to isolate Windsurf behavior without Semble hints.
 - Use `--backend local` or `local-search` for Semble-only chunk results.
 - Lower `--tree-depth` or add `--exclude` if payloads get large.

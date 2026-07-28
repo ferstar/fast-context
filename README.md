@@ -247,10 +247,15 @@ Auto-discovery checks Devin CLI credentials on Linux/WSL first, then local app d
 - `WINDSURF_API_KEY`: explicit credential override
 - `WS_MODEL`: optional model override. Default is `MODEL_SWE_1_6_FAST`
 - `WS_FALLBACK_MODELS`: optional comma-separated fallback chain. Default is `MODEL_SWE_1_5`
+- `WS_REMOTE_LOCK_PATH`: optional cross-process Windsurf lock file. Defaults to a per-user path under the system temp directory
+- `WS_REMOTE_LOCK_TIMEOUT_MS`: maximum wait for the shared remote slot. Default is `120000`
+- `WS_REMOTE_LOCK_POLL_MS`: lock retry interval. Default is `100`
 - `WS_APP_VER`
 - `WS_LS_VER`
 
 ## Model choice
+
+Remote Windsurf sessions are serialized per local user with an OS-level file lock. Local repo-map construction and Semble prefetch still run concurrently; only JWT acquisition, rate-limit checks, model retries, fallback, and the remote semantic loop share the slot. The OS releases the lock if a process exits unexpectedly. If lock waiting times out, `hybrid` degrades to its local Semble results instead of adding another remote request.
 
 Local testing on `2026-05-31` suggests these practical defaults:
 

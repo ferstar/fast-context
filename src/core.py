@@ -14,6 +14,7 @@ Flow:
 from __future__ import annotations
 
 import gzip
+import hashlib
 import json
 import multiprocessing
 import os
@@ -24,12 +25,14 @@ import struct
 import subprocess
 import ssl
 import sys
+import tempfile
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from fnmatch import fnmatch
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
@@ -574,6 +577,8 @@ DEFAULT_WS_FALLBACK_MODELS = ("MODEL_SWE_1_5",)
 DEFAULT_WS_RETRY_BASE_MS = 1000
 DEFAULT_WS_RETRY_MAX_MS = 5000
 DEFAULT_WS_MAX_RETRIES = 2
+DEFAULT_WS_REMOTE_LOCK_TIMEOUT_MS = 120000
+DEFAULT_WS_REMOTE_LOCK_POLL_MS = 100
 WS_APP_VER = os.environ.get("WS_APP_VER", "1.48.2")
 WS_LS_VER = os.environ.get("WS_LS_VER", "1.9544.35")
 
@@ -1116,6 +1121,99 @@ def _env_int(name: str, default: int, minimum: int = 0) -> int:
     return max(minimum, value)
 
 
+class RemoteSearchBusy(RuntimeError):
+    """Raised when another process holds the shared Windsurf search slot."""
+
+
+def _default_remote_lock_path() -> Path:
+    home_fingerprint = hashlib.sha256(str(Path.home()).encode("utf-8")).hexdigest()[:12]
+    lock_dir = Path(tempfile.gettempdir()) / f"fast-context-{home_fingerprint}"
+    lock_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    return lock_dir / "windsurf-remote.lock"
+
+
+def _resolve_remote_lock_config() -> tuple[Path, int, int]:
+    configured_path = os.environ.get("WS_REMOTE_LOCK_PATH", "").strip()
+    lock_path = Path(configured_path).expanduser() if configured_path else _default_remote_lock_path()
+    timeout_ms = _env_int(
+        "WS_REMOTE_LOCK_TIMEOUT_MS",
+        DEFAULT_WS_REMOTE_LOCK_TIMEOUT_MS,
+        minimum=0,
+    )
+    poll_ms = _env_int(
+        "WS_REMOTE_LOCK_POLL_MS",
+        DEFAULT_WS_REMOTE_LOCK_POLL_MS,
+        minimum=10,
+    )
+    return lock_path, timeout_ms, poll_ms
+
+
+def _try_lock_file(file_obj: Any) -> bool:
+    file_obj.seek(0)
+    if os.name == "nt":
+        import msvcrt
+
+        try:
+            msvcrt.locking(file_obj.fileno(), msvcrt.LK_NBLCK, 1)
+            return True
+        except OSError:
+            return False
+
+    import fcntl
+
+    try:
+        fcntl.flock(file_obj.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return True
+    except BlockingIOError:
+        return False
+
+
+def _unlock_file(file_obj: Any) -> None:
+    file_obj.seek(0)
+    if os.name == "nt":
+        import msvcrt
+
+        msvcrt.locking(file_obj.fileno(), msvcrt.LK_UNLCK, 1)
+        return
+
+    import fcntl
+
+    fcntl.flock(file_obj.fileno(), fcntl.LOCK_UN)
+
+
+@contextmanager
+def _remote_search_slot(
+    on_progress: Callable[[str], None] | None = None,
+) -> Iterator[float]:
+    """Serialize Windsurf sessions across local agents and processes."""
+    lock_path, timeout_ms, poll_ms = _resolve_remote_lock_config()
+    lock_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    started = time.monotonic()
+
+    with lock_path.open("a+b") as lock_file:
+        if lock_file.tell() == 0:
+            lock_file.write(b"\0")
+            lock_file.flush()
+
+        announced_wait = False
+        while not _try_lock_file(lock_file):
+            elapsed_ms = (time.monotonic() - started) * 1000
+            if elapsed_ms >= timeout_ms:
+                raise RemoteSearchBusy(
+                    f"远端搜索槽位等待超时（{timeout_ms}ms）：{lock_path}"
+                )
+            if on_progress and not announced_wait:
+                on_progress("另一个 Fast Context 进程正在使用远端搜索，等待共享槽位...")
+                announced_wait = True
+            time.sleep(poll_ms / 1000.0)
+
+        waited_ms = (time.monotonic() - started) * 1000
+        try:
+            yield waited_ms
+        finally:
+            _unlock_file(lock_file)
+
+
 def _resolve_model_candidates(primary_model: str | None = None) -> list[str]:
     primary = (primary_model or os.environ.get("WS_MODEL", DEFAULT_WS_MODEL)).strip()
     fallback_raw = os.environ.get("WS_FALLBACK_MODELS")
@@ -1617,81 +1715,26 @@ def _search_once(
     }
 
 
-def search(
+def _search_remote_models(
+    *,
     query: str,
     project_root: str,
-    api_key: str | None = None,
-    jwt: str | None = None,
-    max_turns: int = 3,
-    max_commands: int = 8,
-    max_results: int = 10,
-    tree_depth: int = 3,
-    timeout_ms: int = 30000,
-    exclude_paths: list[str] | None = None,
-    local_context: str | None = None,
-    on_progress: Callable[[str], None] | None = None,
+    api_key: str,
+    jwt: str,
+    system_prompt: str,
+    tool_defs: list[dict[str, Any]],
+    user_content: str,
+    max_turns: int,
+    timeout_ms: int,
+    actual_depth: int,
+    tree_size_bytes: int,
+    fell_back: bool,
+    repo_map_meta: dict[str, Any],
+    on_progress: Callable[[str], None] | None,
 ) -> Dict[str, Any]:
-    """
-    执行 Fast Context 搜索。
-
-    Args:
-        query: 自然语言搜索查询
-        project_root: 项目根目录
-        api_key: Windsurf API key（不传则自动获取）
-        jwt: JWT token（不传则自动获取）
-        max_turns: 搜索轮数（默认 3，与 Windsurf 原版一致）
-        max_commands: 每轮最大命令数（默认 8）
-        max_results: 最多返回的文件数量
-        tree_depth: repo map 目标深度（1-6）
-        timeout_ms: 流式请求超时
-        exclude_paths: 额外排除路径
-        local_context: 本地检索候选 chunk，注入远端搜索提示
-        on_progress: 进度回调
-
-    Returns:
-        {"files": [...], "error": "..."} 或 {"files": [...]}
-    """
     def log(msg: str) -> None:
         if on_progress:
             on_progress(msg)
-
-    project_root = os.path.abspath(project_root)
-    exclude_paths = exclude_paths or []
-
-    if not api_key:
-        api_key = get_api_key()
-    if not jwt:
-        log("获取 JWT...")
-        jwt = fetch_jwt(api_key)
-
-    tool_defs = get_tool_definitions(max_commands)
-    system_prompt = build_system_prompt(max_turns, max_commands, max_results)
-
-    repo_map, actual_depth, tree_size_bytes, fell_back, repo_map_meta = _get_repo_map_with_meta(
-        project_root,
-        query,
-        tree_depth,
-        exclude_paths,
-    )
-    hot_dirs = repo_map_meta.get("hot_dirs") or []
-    log(
-        f"Repo map: tree -L {actual_depth} "
-        f"({tree_size_bytes / 1024:.1f}KB)"
-        f"{' [fell back]' if fell_back else ''}"
-        f" [strategy={repo_map_meta.get('repo_map_strategy')}]"
-        f"{f' [hot={','.join(hot_dirs)}]' if hot_dirs else ''}"
-    )
-    local_anchor_brief = build_local_anchor_brief(
-        query,
-        project_root,
-        _effective_excludes(exclude_paths),
-    )
-    user_content = "\n\n".join([
-        f"Problem Statement: {query}",
-        local_context or "",
-        local_anchor_brief,
-        f"Repo Map (tree -L {actual_depth} /codebase):\n```text\n{repo_map}\n```",
-    ]).strip()
 
     model_candidates = _resolve_model_candidates()
     retry_base_ms, retry_max_ms, max_model_retries = _resolve_retry_config()
@@ -1700,7 +1743,10 @@ def search(
     for index, model in enumerate(model_candidates, 1):
         for retry_count in range(max_model_retries + 1):
             if retry_count:
-                log(f"检查模型 {model} ({index}/{len(model_candidates)})，重试 {retry_count}/{max_model_retries}")
+                log(
+                    f"检查模型 {model} ({index}/{len(model_candidates)})，"
+                    f"重试 {retry_count}/{max_model_retries}"
+                )
             else:
                 log(f"检查模型 {model} ({index}/{len(model_candidates)})")
 
@@ -1778,6 +1824,117 @@ def search(
             **repo_map_meta,
         },
     }
+
+
+def search(
+    query: str,
+    project_root: str,
+    api_key: str | None = None,
+    jwt: str | None = None,
+    max_turns: int = 3,
+    max_commands: int = 8,
+    max_results: int = 10,
+    tree_depth: int = 3,
+    timeout_ms: int = 30000,
+    exclude_paths: list[str] | None = None,
+    local_context: str | None = None,
+    on_progress: Callable[[str], None] | None = None,
+) -> Dict[str, Any]:
+    """
+    执行 Fast Context 搜索。
+
+    Args:
+        query: 自然语言搜索查询
+        project_root: 项目根目录
+        api_key: Windsurf API key（不传则自动获取）
+        jwt: JWT token（不传则自动获取）
+        max_turns: 搜索轮数（默认 3，与 Windsurf 原版一致）
+        max_commands: 每轮最大命令数（默认 8）
+        max_results: 最多返回的文件数量
+        tree_depth: repo map 目标深度（1-6）
+        timeout_ms: 流式请求超时
+        exclude_paths: 额外排除路径
+        local_context: 本地检索候选 chunk，注入远端搜索提示
+        on_progress: 进度回调
+
+    Returns:
+        {"files": [...], "error": "..."} 或 {"files": [...]}
+    """
+    def log(msg: str) -> None:
+        if on_progress:
+            on_progress(msg)
+
+    project_root = os.path.abspath(project_root)
+    exclude_paths = exclude_paths or []
+
+    if not api_key:
+        api_key = get_api_key()
+
+    tool_defs = get_tool_definitions(max_commands)
+    system_prompt = build_system_prompt(max_turns, max_commands, max_results)
+
+    repo_map, actual_depth, tree_size_bytes, fell_back, repo_map_meta = _get_repo_map_with_meta(
+        project_root,
+        query,
+        tree_depth,
+        exclude_paths,
+    )
+    hot_dirs = repo_map_meta.get("hot_dirs") or []
+    log(
+        f"Repo map: tree -L {actual_depth} "
+        f"({tree_size_bytes / 1024:.1f}KB)"
+        f"{' [fell back]' if fell_back else ''}"
+        f" [strategy={repo_map_meta.get('repo_map_strategy')}]"
+        f"{f' [hot={','.join(hot_dirs)}]' if hot_dirs else ''}"
+    )
+    local_anchor_brief = build_local_anchor_brief(
+        query,
+        project_root,
+        _effective_excludes(exclude_paths),
+    )
+    user_content = "\n\n".join([
+        f"Problem Statement: {query}",
+        local_context or "",
+        local_anchor_brief,
+        f"Repo Map (tree -L {actual_depth} /codebase):\n```text\n{repo_map}\n```",
+    ]).strip()
+
+    try:
+        with _remote_search_slot(on_progress=on_progress) as lock_wait_ms:
+            if not jwt:
+                log("获取 JWT...")
+                jwt = fetch_jwt(api_key)
+            result = _search_remote_models(
+                query=query,
+                project_root=project_root,
+                api_key=api_key,
+                jwt=jwt,
+                system_prompt=system_prompt,
+                tool_defs=tool_defs,
+                user_content=user_content,
+                max_turns=max_turns,
+                timeout_ms=timeout_ms,
+                actual_depth=actual_depth,
+                tree_size_bytes=tree_size_bytes,
+                fell_back=fell_back,
+                repo_map_meta=repo_map_meta,
+                on_progress=on_progress,
+            )
+            result.setdefault("_meta", {})["remote_lock_wait_ms"] = round(lock_wait_ms, 1)
+            return result
+    except RemoteSearchBusy as exc:
+        return {
+            "files": [],
+            "error": str(exc),
+            "_meta": {
+                "tree_depth": actual_depth,
+                "tree_size_kb": round(tree_size_bytes / 1024, 1),
+                "fell_back": fell_back,
+                "project_root": project_root,
+                "error_code": "remote_lock_timeout",
+                **repo_map_meta,
+            },
+        }
 
 
 def _parse_answer(xml_text: str, project_root: str) -> Dict[str, Any]:

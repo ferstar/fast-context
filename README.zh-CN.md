@@ -247,10 +247,15 @@ uv run fast-context extract-key --db-path ~/.local/share/devin/credentials.toml
 - `WINDSURF_API_KEY`：显式覆盖凭据
 - `WS_MODEL`：可选模型覆盖，默认 `MODEL_SWE_1_6_FAST`
 - `WS_FALLBACK_MODELS`：可选的逗号分隔 fallback 链，默认 `MODEL_SWE_1_5`
+- `WS_REMOTE_LOCK_PATH`：可选的跨进程 Windsurf 锁文件；默认使用系统临时目录下的用户级路径
+- `WS_REMOTE_LOCK_TIMEOUT_MS`：等待共享远端槽位的最长时间，默认 `120000`
+- `WS_REMOTE_LOCK_POLL_MS`：锁重试间隔，默认 `100`
 - `WS_APP_VER`
 - `WS_LS_VER`
 
 ## 模型选择
+
+同一用户的远端 Windsurf 会话会通过 OS 级文件锁串行执行。本地 repo map 和 Semble 预取仍可并行，只有 JWT 获取、限流检查、模型重试、fallback 和远端语义循环占用共享槽位。进程异常退出时 OS 会自动释放锁；等待超时后，`hybrid` 会降级到本地 Semble 结果，不再追加远端请求。
 
 基于 `2026-05-31` 在本地跑过的测试，当前比较顺手的默认值是：
 

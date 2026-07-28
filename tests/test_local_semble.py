@@ -108,7 +108,7 @@ class LocalSembleOutputTest(unittest.TestCase):
 
         self.assertIn("Start here:", result)
         self.assertIn("Local Semble chunk candidates:", result)
-        self.assertIn("src/search.py", result)
+        self.assertIn(str(remote_path), result)
         mock_remote_search.assert_called_once()
         local_context = mock_remote_search.call_args.kwargs["local_context"]
         self.assertIn("Local Semble chunk candidates:", local_context)
@@ -145,7 +145,7 @@ class LocalSembleOutputTest(unittest.TestCase):
         self.assertIn("Error: [Error] resource_exhausted: backend overloaded", result)
         self.assertIn("Using local Semble results.", result)
         self.assertIn("Local Semble results:", result)
-        self.assertIn("src/search.py", result)
+        self.assertIn(str(self.project_root / "src/search.py"), result)
 
     @patch("core.semble_find_related")
     def test_find_related_formats_chunks(self, mock_find_related) -> None:

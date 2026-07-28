@@ -58,21 +58,33 @@ def _build_index(
     content: list[str],
 ) -> tuple[Any, str]:
     SembleIndex, _, _, _, save_index_to_cache = _load_semble_api()
+    content_types = _content_types(content)
 
     try:
-        index = SembleIndex.from_path(project_root, content=_content_types(content))
+        index = SembleIndex.from_path(project_root, content=content_types)
     except Exception as exc:
-        raise SembleUnavailable(f"semble indexing failed: {exc}") from exc
+        cache_result = clear_project_cache(project_root)
+        if not cache_result["removed"]:
+            raise SembleUnavailable(f"semble indexing failed: {exc}") from exc
+        try:
+            index = SembleIndex.from_path(project_root, content=content_types)
+        except Exception as retry_exc:
+            raise SembleUnavailable(
+                f"semble indexing failed after cache recovery: {retry_exc}"
+            ) from retry_exc
+        cache_status = "recovered"
+    else:
+        cache_status = "hit" if getattr(index, "loaded_from_disk", False) else "miss"
 
     if getattr(index, "loaded_from_disk", False):
-        return index, "hit"
+        return index, cache_status
 
     try:
         save_index_to_cache(index, project_root)
     except Exception:
-        return index, "save_failed"
+        return index, "recovered_save_failed" if cache_status == "recovered" else "save_failed"
 
-    return index, "saved"
+    return index, "recovered" if cache_status == "recovered" else "saved"
 
 
 def _path_size(path: Path) -> int:

@@ -18,7 +18,6 @@ import json
 import multiprocessing
 import os
 import platform
-import random
 import re
 import sqlite3
 import struct
@@ -1162,8 +1161,7 @@ def _resolve_retry_config() -> tuple[int, int, int]:
 
 
 def _sleep_with_backoff(base_ms: int, max_ms: int, attempt: int) -> float:
-    cap_ms = min(max_ms, base_ms * (2 ** attempt))
-    delay_ms = random.uniform(base_ms, cap_ms)
+    delay_ms = min(max_ms, base_ms * (2 ** max(attempt - 1, 0)))
     time.sleep(delay_ms / 1000.0)
     return delay_ms
 

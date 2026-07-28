@@ -237,6 +237,78 @@ class LocalSembleAdapterTest(unittest.TestCase):
         fake_save_index.assert_not_called()
         self.assertEqual(payload["_meta"]["cache"], "hit")
 
+    def test_search_recovers_from_corrupted_cached_index(self) -> None:
+        rebuilt_index = Mock()
+        rebuilt_index.loaded_from_disk = False
+        rebuilt_index.search.return_value = ["hit"]
+        fake_semble_index = Mock()
+        fake_semble_index.from_path.side_effect = [
+            json.JSONDecodeError("Extra data", "{}", 1),
+            rebuilt_index,
+        ]
+        fake_save_index = Mock()
+
+        with (
+            patch(
+                "local_semble._load_semble_api",
+                return_value=(
+                    fake_semble_index,
+                    _FakeContentType(),
+                    Mock(return_value={"query": "q", "results": ["hit"]}),
+                    Mock(),
+                    fake_save_index,
+                ),
+            ),
+            patch(
+                "local_semble.clear_project_cache",
+                return_value={"removed": True},
+            ) as mock_clear_cache,
+        ):
+            payload = local_semble.search(
+                query="q",
+                project_root=str(self.project_root),
+                top_k=2,
+                content=["code"],
+            )
+
+        resolved_root = str(self.project_root.resolve())
+        self.assertEqual(fake_semble_index.from_path.call_count, 2)
+        mock_clear_cache.assert_called_once_with(resolved_root)
+        fake_save_index.assert_called_once_with(rebuilt_index, resolved_root)
+        self.assertEqual(payload["_meta"]["cache"], "recovered")
+
+    def test_search_does_not_retry_without_existing_cache(self) -> None:
+        fake_semble_index = Mock()
+        fake_semble_index.from_path.side_effect = ValueError("source parsing failed")
+
+        with (
+            patch(
+                "local_semble._load_semble_api",
+                return_value=(
+                    fake_semble_index,
+                    _FakeContentType(),
+                    Mock(),
+                    Mock(),
+                    Mock(),
+                ),
+            ),
+            patch(
+                "local_semble.clear_project_cache",
+                return_value={"removed": False},
+            ),
+        ):
+            with self.assertRaisesRegex(
+                local_semble.SembleUnavailable,
+                "semble indexing failed: source parsing failed",
+            ):
+                local_semble.search(
+                    query="q",
+                    project_root=str(self.project_root),
+                    content=["code"],
+                )
+
+        fake_semble_index.from_path.assert_called_once()
+
 
 class LocalSembleCacheTest(unittest.TestCase):
     def setUp(self) -> None:

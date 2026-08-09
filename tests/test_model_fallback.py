@@ -20,6 +20,24 @@ class ModelFallbackTest(unittest.TestCase):
     def tearDown(self) -> None:
         self.temp_dir.cleanup()
 
+    def test_default_model_candidates_use_swe_1_7_with_legacy_fallbacks(self) -> None:
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(
+                core._resolve_model_candidates(),
+                ["swe-1-7", "MODEL_SWE_1_6_FAST", "MODEL_SWE_1_5"],
+            )
+
+    def test_lightning_model_can_be_selected_with_ws_model(self) -> None:
+        with patch.dict(
+            os.environ,
+            {"WS_MODEL": "swe-1-7-lightning"},
+            clear=True,
+        ):
+            self.assertEqual(
+                core._resolve_model_candidates(),
+                ["swe-1-7-lightning", "MODEL_SWE_1_6_FAST", "MODEL_SWE_1_5"],
+            )
+
     @patch("core.time.sleep")
     def test_backoff_grows_exponentially_and_caps(self, mock_sleep) -> None:
         delays = [

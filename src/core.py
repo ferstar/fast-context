@@ -572,8 +572,8 @@ class ToolExecutor:
 API_BASE = "https://server.self-serve.windsurf.com/exa.api_server_pb.ApiServerService"
 AUTH_BASE = "https://server.self-serve.windsurf.com/exa.auth_pb.AuthService"
 WS_APP = "windsurf"
-DEFAULT_WS_MODEL = "MODEL_SWE_1_6_FAST"
-DEFAULT_WS_FALLBACK_MODELS = ("MODEL_SWE_1_5",)
+DEFAULT_WS_MODEL = "swe-1-7"
+DEFAULT_WS_FALLBACK_MODELS = ("MODEL_SWE_1_6_FAST", "MODEL_SWE_1_5")
 DEFAULT_WS_RETRY_BASE_MS = 1000
 DEFAULT_WS_RETRY_MAX_MS = 5000
 DEFAULT_WS_MAX_RETRIES = 2

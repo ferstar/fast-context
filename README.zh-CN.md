@@ -245,8 +245,8 @@ uv run fast-context extract-key --db-path ~/.local/share/devin/credentials.toml
 ## 环境变量
 
 - `WINDSURF_API_KEY`：显式覆盖凭据
-- `WS_MODEL`：可选模型覆盖，默认 `MODEL_SWE_1_6_FAST`
-- `WS_FALLBACK_MODELS`：可选的逗号分隔 fallback 链，默认 `MODEL_SWE_1_5`
+- `WS_MODEL`：可选模型覆盖，默认 `swe-1-7`；设为 `swe-1-7-lightning` 可主动选择 Lightning
+- `WS_FALLBACK_MODELS`：可选的逗号分隔 fallback 链，默认 `MODEL_SWE_1_6_FAST,MODEL_SWE_1_5`
 - `WS_REMOTE_LOCK_PATH`：可选的跨进程 Windsurf 锁文件；默认使用系统临时目录下的用户级路径
 - `WS_REMOTE_LOCK_TIMEOUT_MS`：等待共享远端槽位的最长时间，默认 `120000`
 - `WS_REMOTE_LOCK_POLL_MS`：锁重试间隔，默认 `100`
@@ -257,12 +257,12 @@ uv run fast-context extract-key --db-path ~/.local/share/devin/credentials.toml
 
 同一用户的远端 Windsurf 会话会通过 OS 级文件锁串行执行。本地 repo map 和 Semble 预取仍可并行，只有 JWT 获取、限流检查、模型重试、fallback 和远端语义循环占用共享槽位。进程异常退出时 OS 会自动释放锁；等待超时后，`hybrid` 会降级到本地 Semble 结果，不再追加远端请求。
 
-基于 `2026-05-31` 在本地跑过的测试，当前比较顺手的默认值是：
+基于 `2026-08-09` 的实时验证，当前默认值如下：
 
-- `MODEL_SWE_1_6_FAST` —— 日常 coding 用和一次性仓库定位，最稳。
-- 主模型遇上 `resource_exhausted` 或限流时，会自动 fallback 到 `MODEL_SWE_1_5`。
-- 想自己调 fallback 顺序的话，设 `WS_FALLBACK_MODELS` 就行，比如 `WS_FALLBACK_MODELS=MODEL_SWE_1_5,MODEL_SWE_1_6`。
-- `MODEL_SWE_1_7_FAST` 暂时不推荐。
+- 新模型使用字符串 `model_uid`。默认值是 `swe-1-7`，不使用 `MODEL_SWE_1_7_FAST` 这类猜测的数字枚举名。
+- `swe-1-7` 与 `swe-1-7-lightning` 都完成了 3/3 次仅候选模型的完整远端探测；fallback 已禁用，并逐次核对实际模型身份。
+- `swe-1-7-lightning` 是通过 `WS_MODEL` 主动选择的可选项。它在极小 fixture 探测中的 p50 与基础 SWE-1.7 基本持平，因此不作为默认值。
+- 默认 fallback 顺序是 `MODEL_SWE_1_6_FAST`，然后 `MODEL_SWE_1_5`。可用 `WS_FALLBACK_MODELS` 覆盖；设为空字符串可完全禁用 fallback。
 
 这些结论是经验性的，不保证永远对。上游容量一变，延迟和成功率也会跟着变。
 

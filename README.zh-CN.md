@@ -240,11 +240,14 @@ uv run fast-context extract-key --db-path /tmp/state.vscdb
 uv run fast-context extract-key --db-path ~/.local/share/devin/credentials.toml
 ```
 
-自动发现会先检查 Linux/WSL 下的 Devin CLI credentials，然后再找 `Deviv`、`Devin`、`Windsurf` 本地 app 数据库。当前安装里，凭据可能是传统 API key，也可能是 `devin-session-token$...` 这种 session 风格 token。只要 Windsurf/Devin 自己接受，这个仓库也会直接接受。
+自动发现会先检查 Linux/WSL 下的 Devin CLI credentials，然后再找 `Deviv`、`Devin`、`Windsurf` 本地 app 数据库（规范大小写与小写两种目录名都会探测，因为安装器并不统一，例如 Windows 上的 Devin 会写成 `devin`）。当前安装里，凭据可能是传统 API key，也可能是 `devin-session-token$...` 这种 session 风格 token。只要 Windsurf/Devin 自己接受，这个仓库也会直接接受。
+
+以上来源都不可用时报错会带上实际查找过的路径。如果凭据来自其他主机，可以把拷贝出来的库放到上述任一本地路径让自动发现生效，也可以直接用 `WINDSURF_CREDENTIALS_DB` 指向那个副本。
 
 ## 环境变量
 
 - `WINDSURF_API_KEY`：显式覆盖凭据
+- `WINDSURF_CREDENTIALS_DB`：显式指定凭据文件（`state.vscdb` 或 `credentials.toml`）。设置后只读该文件，不再探测本机应用目录
 - `WS_MODEL`：可选模型覆盖，默认 `MODEL_SWE_1_6_FAST`
 - `WS_FALLBACK_MODELS`：可选的逗号分隔 fallback 链，默认 `MODEL_SWE_1_5`
 - `WS_REMOTE_LOCK_PATH`：可选的跨进程 Windsurf 锁文件；默认使用系统临时目录下的用户级路径

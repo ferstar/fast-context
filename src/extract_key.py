@@ -32,6 +32,27 @@ TOML_API_KEY_FIELDS = (
     "token",
 )
 
+# 安装目录名候选，规范大小写在前。
+APP_DIR_NAMES = ("Deviv", "Devin", "Windsurf")
+
+# 显式指定要读取的凭据文件（state.vscdb 或 credentials.toml）。
+WINDSURF_CREDENTIALS_DB_ENV = "WINDSURF_CREDENTIALS_DB"
+
+
+def app_dir_names() -> tuple[str, ...]:
+    """展开安装目录名候选，规范形态后紧跟小写形态。
+
+    安装器对大小写并不一致：Windows 上的 Devin 写 `%APPDATA%\\devin`，而
+    Windsurf 写 `Windsurf`。Windows 与 macOS 的文件系统大小写不敏感，只列规范
+    形态也能命中；Linux 大小写敏感，两种形态都要探测。
+    """
+    names: list[str] = []
+    for name in APP_DIR_NAMES:
+        for candidate in (name, name.lower()):
+            if candidate not in names:
+                names.append(candidate)
+    return tuple(names)
+
 
 def get_db_path_candidates(
     system: str | None = None,
@@ -42,7 +63,7 @@ def get_db_path_candidates(
     system = system or platform.system()
     home = home or Path.home()
     env = env or os.environ
-    app_names = ("Deviv", "Devin", "Windsurf")
+    app_names = app_dir_names()
 
     if system == "Darwin":  # macOS
         return [
@@ -76,9 +97,29 @@ def get_cli_credential_path_candidates(
     return [home / ".local" / "share" / "devin" / "credentials.toml"]
 
 
-def get_credential_sources() -> list[dict[str, Path | str]]:
-    toml_sources = [{"type": "toml", "path": path} for path in get_cli_credential_path_candidates()]
-    sqlite_sources = [{"type": "sqlite", "path": path} for path in get_db_path_candidates()]
+def get_credential_sources(
+    system: str | None = None,
+    home: Path | None = None,
+    env: dict[str, str] | None = None,
+) -> list[dict[str, Path | str]]:
+    """凭据来源候选。
+
+    设置 WINDSURF_CREDENTIALS_DB 时只返回该来源：显式指定的路径若不可用，应当
+    报错而不是悄悄回落到本机其他账号的凭据。
+    """
+    env = env if env is not None else os.environ
+    explicit = (env.get(WINDSURF_CREDENTIALS_DB_ENV) or "").strip()
+    if explicit:
+        path = Path(explicit).expanduser()
+        source_type = "toml" if path.suffix == ".toml" else "sqlite"
+        return [{"type": source_type, "path": path}]
+
+    toml_sources = [
+        {"type": "toml", "path": path} for path in get_cli_credential_path_candidates(system, home)
+    ]
+    sqlite_sources = [
+        {"type": "sqlite", "path": path} for path in get_db_path_candidates(system, home, env)
+    ]
     return [*toml_sources, *sqlite_sources]
 
 
@@ -201,12 +242,22 @@ def extract_key(db_path: str | Path | None = None) -> dict:
     if first_existing_error is not None:
         return {**first_existing_error, "tried_paths": tried_paths}
 
+    explicit = (os.environ.get(WINDSURF_CREDENTIALS_DB_ENV) or "").strip()
+    if explicit:
+        return {
+            "error": f"{WINDSURF_CREDENTIALS_DB_ENV} 指向的文件不可用",
+            "hint": f"确认 {explicit} 存在，且指向 Windsurf/Devin 的 state.vscdb 或 credentials.toml。",
+            "db_path": explicit,
+            "tried_paths": tried_paths,
+        }
+
     return {
         "error": "未找到 Windsurf/Devin 凭据来源",
         "hint": "请确保 Devin 或 Windsurf 已安装并登录。",
         "db_path": tried_paths[0] if tried_paths else "",
         "tried_paths": tried_paths,
     }
+
 
 def _parse_db_path(argv: list[str]) -> Path | None:
     if "--db-path" not in argv:

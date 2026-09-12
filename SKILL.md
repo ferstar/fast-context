@@ -81,16 +81,19 @@ uv run --project "$SKILL_DIR" fast-context search \
 
 ## Authentication
 
-- The CLI first checks `WINDSURF_API_KEY`.
-- If that is unset, it reads Devin CLI credentials on Linux/WSL, then local `Deviv`, `Devin`, and `Windsurf` `state.vscdb` files.
+- The CLI first checks `WINDSURF_API_KEY`, then `WINDSURF_CREDENTIALS_DB`.
+- `WINDSURF_CREDENTIALS_DB` points at one explicit credentials file (a `state.vscdb` or `credentials.toml`). When it is set only that file is read, so a bad path fails loudly instead of silently falling back to another account.
+- Otherwise it reads Devin CLI credentials on Linux/WSL, then local `Deviv`, `Devin`, and `Windsurf` `state.vscdb` files, probing both the canonical and lowercase directory spelling.
 - That auto-discovery only works on the same machine where Windsurf/Devin is installed or where `devin login` has been run.
 - Current installs may store session-style credentials such as `devin-session-token$...`; this skill accepts them directly.
-- If Windsurf/Devin lives on another host, copy the database or credentials file locally and run:
+- If Windsurf/Devin lives on another host, copy the database or credentials file locally, then either point `WINDSURF_CREDENTIALS_DB` at the copy or place it in one of the local paths above so auto-discovery picks it up, and run:
 
 ```bash
 uv run --project "$SKILL_DIR" fast-context extract-key --db-path "<copied-state.vscdb>"
 uv run --project "$SKILL_DIR" fast-context extract-key --db-path "<copied-credentials.toml>"
 ```
+
+A copied `state.vscdb` also works without any environment variable once it sits at one of the local paths the CLI probes, for example `~/Library/Application Support/Devin/User/globalStorage/state.vscdb` on macOS. Refresh that copy when the stored session token expires.
 
 ## Cache maintenance
 

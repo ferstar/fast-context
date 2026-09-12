@@ -240,11 +240,14 @@ uv run fast-context extract-key --db-path /tmp/state.vscdb
 uv run fast-context extract-key --db-path ~/.local/share/devin/credentials.toml
 ```
 
-Auto-discovery checks Devin CLI credentials on Linux/WSL first, then local app databases under `Deviv`, `Devin`, and `Windsurf` app data paths. Current installs may store either classic API keys or session-style credentials such as `devin-session-token$...`. This repo accepts either form as long as Windsurf/Devin accepts it.
+Auto-discovery checks Devin CLI credentials on Linux/WSL first, then local app databases under `Deviv`, `Devin`, and `Windsurf` app data paths, probing both the canonical and lowercase directory spelling because installers disagree on casing (a Windows Devin install writes `devin`). Current installs may store either classic API keys or session-style credentials such as `devin-session-token$...`. This repo accepts either form as long as Windsurf/Devin accepts it.
+
+When no source is usable the error lists the paths that were searched. Credentials copied from another host can either be placed at one of those local paths so auto-discovery picks them up, or read directly by pointing `WINDSURF_CREDENTIALS_DB` at the copy.
 
 ## Environment
 
 - `WINDSURF_API_KEY`: explicit credential override
+- `WINDSURF_CREDENTIALS_DB`: explicit credentials file (`state.vscdb` or `credentials.toml`). When set, only that file is read and the local app-data paths are not probed
 - `WS_MODEL`: optional model override. Default is `MODEL_SWE_1_6_FAST`
 - `WS_FALLBACK_MODELS`: optional comma-separated fallback chain. Default is `MODEL_SWE_1_5`
 - `WS_REMOTE_LOCK_PATH`: optional cross-process Windsurf lock file. Defaults to a per-user path under the system temp directory

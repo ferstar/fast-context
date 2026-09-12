@@ -1079,31 +1079,54 @@ def build_local_anchor_brief(
 
 # ─── 凭证 ──────────────────────────────────────────────────
 
-def auto_discover_api_key() -> Optional[str]:
+def extract_windsurf_credential() -> Dict[str, Any]:
+    """读取本机 Windsurf/Devin 凭据，保留失败原因与已探测路径。"""
     try:
         from extract_key import extract_key
-
+    except Exception as exc:  # pragma: no cover - 仅在提取器不可用时触发
+        return {"error": f"Windsurf 凭据提取器不可用: {exc}"}
+    try:
         result = extract_key()
-        api_key = (result.get("api_key") or "").strip()
-        if api_key:
-            return api_key
-    except Exception:
-        pass
-    return None
+    except Exception as exc:
+        return {"error": f"Windsurf 凭据提取失败: {exc}"}
+    if not isinstance(result, dict):
+        return {"error": "Windsurf 凭据提取返回了意外结果"}
+    return result
+
+
+def auto_discover_api_key() -> Optional[str]:
+    api_key = (extract_windsurf_credential().get("api_key") or "").strip()
+    return api_key or None
+
+
+def _credential_missing_message(credential: Dict[str, Any]) -> str:
+    """把来源探测结果带进报错，避免只留一句无法定位的提示。"""
+    reason = credential.get("error") or "未在本机找到 Windsurf/Devin 凭据"
+    hint = credential.get("hint") or "请确保 Windsurf 或 Devin 已安装并登录。"
+    searched = [str(path) for path in (credential.get("tried_paths") or []) if path]
+    lines = [f"未找到 Windsurf API Key：{reason}", f"[hint] {hint}"]
+    if searched:
+        lines.append("[paths] 已查找：" + "、".join(searched))
+    # 失败原因本身来自显式路径时，再建议设置它只会绕圈。
+    explicit = (os.environ.get("WINDSURF_CREDENTIALS_DB") or "").strip()
+    if not (explicit and searched == [explicit]):
+        lines.append(
+            "[hint] 也可以设置 WINDSURF_CREDENTIALS_DB 指向任意 state.vscdb"
+            "（例如从其他主机拷贝的副本），或直接设置 WINDSURF_API_KEY。"
+        )
+    return "\n".join(lines)
 
 
 def get_api_key() -> str:
-    """获取 API key：环境变量 > 自动发现。"""
+    """获取 API key：环境变量 > 显式凭据文件 > 自动发现。"""
     key = os.environ.get("WINDSURF_API_KEY")
     if key:
         return key
-    key = auto_discover_api_key()
+    credential = extract_windsurf_credential()
+    key = (credential.get("api_key") or "").strip()
     if key:
         return key
-    raise RuntimeError(
-        "未找到 Windsurf API Key。请设置环境变量 WINDSURF_API_KEY "
-        "或确保 Windsurf 已登录。运行 src/extract_key.py 查看提取方法。"
-    )
+    raise RuntimeError(_credential_missing_message(credential))
 
 
 def _parse_model_env(raw: str) -> list[str]:
@@ -2361,7 +2384,11 @@ def _format_error_result(
             f"max_commands={max_commands}, timeout_ms={timeout_ms}"
         )
     if "AUTH_ERROR" in result["error"]:
-        message += "\n[hint] Windsurf 凭证可能已过期，重新提取后设置 WINDSURF_API_KEY 再试。"
+        message += (
+            "\n[hint] Windsurf 凭证可能已过期。覆盖当前凭据来源后重试："
+            "WINDSURF_CREDENTIALS_DB 指向的 state.vscdb、本机应用目录下的同名文件，"
+            "或 WINDSURF_API_KEY 环境变量。"
+        )
     elif "PAYLOAD_TOO_LARGE" in result["error"] or "TIMEOUT" in result["error"]:
         message += "\n[hint] 尝试降低 tree_depth、缩小 project_root，或增加 exclude_paths。"
     elif "resource_exhausted" in result["error"].lower():

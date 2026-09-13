@@ -248,8 +248,8 @@ When no source is usable the error lists the paths that were searched. Credentia
 
 - `WINDSURF_API_KEY`: explicit credential override
 - `WINDSURF_CREDENTIALS_DB`: explicit credentials file (`state.vscdb` or `credentials.toml`). When set, only that file is read and the local app-data paths are not probed
-- `WS_MODEL`: optional model override. Default is `MODEL_SWE_1_6_FAST`
-- `WS_FALLBACK_MODELS`: optional comma-separated fallback chain. Default is `MODEL_SWE_1_5`
+- `WS_MODEL`: optional model override. Default is `swe-1-7`; use `swe-1-7-lightning` to opt into Lightning
+- `WS_FALLBACK_MODELS`: optional comma-separated fallback chain. Default is `MODEL_SWE_1_6_FAST,MODEL_SWE_1_5`
 - `WS_REMOTE_LOCK_PATH`: optional cross-process Windsurf lock file. Defaults to a per-user path under the system temp directory
 - `WS_REMOTE_LOCK_TIMEOUT_MS`: maximum wait for the shared remote slot. Default is `120000`
 - `WS_REMOTE_LOCK_POLL_MS`: lock retry interval. Default is `100`
@@ -260,12 +260,12 @@ When no source is usable the error lists the paths that were searched. Credentia
 
 Remote Windsurf sessions are serialized per local user with an OS-level file lock. Local repo-map construction and Semble prefetch still run concurrently; only JWT acquisition, rate-limit checks, model retries, fallback, and the remote semantic loop share the slot. The OS releases the lock if a process exits unexpectedly. If lock waiting times out, `hybrid` degrades to its local Semble results instead of adding another remote request.
 
-Local testing on `2026-05-31` suggests these practical defaults:
+Live validation on `2026-08-09` established these practical defaults:
 
-- `MODEL_SWE_1_6_FAST` is the best default for individual day-to-day coding use and one-off repo lookups.
-- This repo now automatically falls back to `MODEL_SWE_1_5` when the primary model hits `resource_exhausted` or model-specific rate limiting.
-- If you want a different fallback order, set `WS_FALLBACK_MODELS`, for example `WS_FALLBACK_MODELS=MODEL_SWE_1_5,MODEL_SWE_1_6`.
-- `MODEL_SWE_1_7_FAST` is currently not recommended.
+- Current models use string `model_uid` values. The default is `swe-1-7`; guessed numeric enum names such as `MODEL_SWE_1_7_FAST` are not used.
+- `swe-1-7` and `swe-1-7-lightning` each completed 3/3 candidate-only remote probes with fallback disabled and returned results. The client cannot observe the server-side model identity (`_meta.model` only echoes the requested uid), so these probes establish that the uid is accepted, not which backend model served the request.
+- `swe-1-7-lightning` is an explicit opt-in through `WS_MODEL`. Its tiny-fixture p50 was effectively tied with base SWE-1.7, so Lightning is not the default.
+- The default fallback order is `MODEL_SWE_1_6_FAST` then `MODEL_SWE_1_5`. Set `WS_FALLBACK_MODELS` to override it or to an empty string to disable fallback.
 
 These results are empirical rather than guaranteed. Upstream capacity variance can affect both latency and success rate.
 

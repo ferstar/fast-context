@@ -396,14 +396,14 @@ Fast Context works best when configured as an agent skill via `SKILL.md`, but th
 
 ## Data & Privacy
 
-Fast Context is designed with strict data isolation and privacy boundaries in mind:
-
+- **Zero Middleware & No Telemetry**: Fast Context runs completely locally. It **does not host any proxy servers or intermediate backends, and collects no telemetry, tracking, or logs**. The code is fully open source.
+- **Direct Official Communication**: In hybrid or remote modes (`--backend hybrid` / `remote`), all requests communicate directly from your machine to official Windsurf / Devin API endpoints using your local credentials. Any data processed or retained by those models is governed strictly by your agreement with Windsurf / Devin, independent of this project.
 - **Fully Offline Local Search (`--backend local`)**:
-  - Indexing and retrieval run entirely on your local machine using Semble, generating **zero external network requests**. All chunks and caches stay on local disk. Ideal for air-gapped environments, proprietary source code, or strict corporate compliance.
-- **Hybrid & Remote Modes (`--backend hybrid` / `remote`)**:
-  - **Path Sanitization**: Real local file paths (such as `/Users/.../project`) are masked and remapped to virtual `/codebase` paths before any payload leaves your machine, preventing local usernames and filesystem structures from leaking.
-  - **No Full Repository Uploads**: Fast Context never bundles or uploads entire repositories. It only transmits the query, masked directory outlines (Repo Map), lexical anchor tokens, and bounded snippets retrieved by restricted `rg` / `readfile` commands requested by the remote model during active verification rounds.
-  - **Sandboxed Execution**: Model-directed inspection commands (`rg`, `readfile`, `ls`, `tree`, `glob`) execute strictly locally and are clamped within the project root directory, preventing directory traversal or reading files outside the project.
+  - Indexing and search execute entirely on your machine using Semble with **zero external network requests**. All chunks and caches remain on local disk. Ideal for air-gapped environments or strict corporate compliance.
+- **Local Protection Safeguards**:
+  - **Path Sanitization**: Real local absolute paths (e.g. `/Users/.../project`) are masked and remapped to virtual `/codebase` paths before leaving your machine, protecting local usernames and directory layouts.
+  - **No Repository Dumping**: The codebase is never bundled or uploaded wholesale. Payloads are limited to queries, masked tree outlines (Repo Map), lexical anchors, and bounded code snippets read on-demand by model-instructed `rg` / `readfile` commands.
+  - **Local Sandboxing**: Read-only tools invoked by the remote model run with strict root-directory boundaries, preventing access outside the project.
 
 ## Implementation Details
 

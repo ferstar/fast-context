@@ -46,10 +46,11 @@ class ExtractKeyTest(unittest.TestCase):
         self.assertEqual(
             db_paths,
             [
-                config / "Deviv" / "User" / "globalStorage" / "state.vscdb",
-                config / "deviv" / "User" / "globalStorage" / "state.vscdb",
+                # Devin 是当前应用名，优先于兼容回退的 Deviv / Windsurf。
                 config / "Devin" / "User" / "globalStorage" / "state.vscdb",
                 config / "devin" / "User" / "globalStorage" / "state.vscdb",
+                config / "Deviv" / "User" / "globalStorage" / "state.vscdb",
+                config / "deviv" / "User" / "globalStorage" / "state.vscdb",
                 config / "Windsurf" / "User" / "globalStorage" / "state.vscdb",
                 config / "windsurf" / "User" / "globalStorage" / "state.vscdb",
             ],

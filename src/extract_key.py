@@ -32,8 +32,9 @@ TOML_API_KEY_FIELDS = (
     "token",
 )
 
-# 安装目录名候选，规范大小写在前。
-APP_DIR_NAMES = ("Deviv", "Devin", "Windsurf")
+# 安装目录名候选，规范大小写在前。Devin 是当前应用名，Deviv 与 Windsurf 是
+# 兼容回退，因此 Devin 优先：同一台机器同时存在两份安装目录时，先读当前应用。
+APP_DIR_NAMES = ("Devin", "Deviv", "Windsurf")
 
 # 显式指定要读取的凭据文件（state.vscdb 或 credentials.toml）。
 WINDSURF_CREDENTIALS_DB_ENV = "WINDSURF_CREDENTIALS_DB"

@@ -285,18 +285,56 @@ class FastContextError(RuntimeError):
         self.details = details
 
 
+# 模型给出的路径不可信：Windows 盘符/UNC 在任何平台上都按越界处理。
+_WINDOWS_ABSOLUTE_RE = re.compile(r"^(?:[A-Za-z]:[\\/]|\\\\)")
+VIRTUAL_ROOT_RE = re.compile(r"^[/\\]codebase(?:[/\\](.*))?$", re.DOTALL)
+
+
+def is_path_within_root(root: str, candidate: str) -> bool:
+    """判断 candidate 是否落在 root 内（解析符号链接后比较）。"""
+    root_real = os.path.realpath(root)
+    try:
+        resolved = os.path.realpath(candidate)
+        return os.path.commonpath([root_real, resolved]) == root_real
+    except (ValueError, OSError):
+        return False
+
+
+def resolve_within_root(root: str, value: str) -> Tuple[str | None, str | None]:
+    """把模型给出的路径解析成项目根内的真实路径。
+
+    只接受三类输入：`/codebase/...` 虚拟根、相对项目根的相对路径（不依赖进程
+    cwd）、以及落在项目根内的绝对路径。存在的部分用 realpath 规范化，符号链接
+    不能成为逃逸通道。越界返回 (None, 错误说明)，该说明可直接回给模型让它改。
+    """
+    if not isinstance(value, str) or not value.strip():
+        return None, "Error: missing or invalid path"
+    text = value.strip()
+    if _WINDOWS_ABSOLUTE_RE.match(text):
+        return None, f"Error: path outside codebase: {value}"
+
+    virtual = VIRTUAL_ROOT_RE.match(text)
+    if virtual:
+        text = virtual.group(1) or ""
+
+    candidate = text if os.path.isabs(text) else os.path.join(root, text)
+    if not is_path_within_root(root, candidate):
+        return None, (
+            f"Error: path outside codebase: {value}. "
+            "Only paths inside the project root are readable."
+        )
+    return os.path.realpath(candidate), None
+
+
 class ToolExecutor:
     """在本地项目目录执行 SWE-grep 的受限工具命令。"""
-
     def __init__(self, project_root: str) -> None:
-        self.root = os.path.abspath(project_root)
+        self.root = os.path.realpath(os.path.abspath(project_root))
         self.collected_rg_patterns: List[str] = []
 
-    def _real(self, virtual: str) -> str:
-        if virtual.startswith("/codebase"):
-            rel = virtual[len("/codebase") :].lstrip("/")
-            return os.path.join(self.root, rel)
-        return virtual
+    def resolve(self, value: str) -> Tuple[str | None, str | None]:
+        """解析模型给出的路径；越界时返回 (None, 可直接回给模型的错误)。"""
+        return resolve_within_root(self.root, value)
 
     @staticmethod
     def _truncate(text: str) -> str:
@@ -426,7 +464,9 @@ class ToolExecutor:
            include: list[str] | None = None,
            exclude: list[str] | None = None) -> str:
         self.collected_rg_patterns.append(pattern)
-        rp = self._real(path)
+        rp, error = self.resolve(path)
+        if error:
+            return error
         if not os.path.exists(rp):
             return f"Error: path does not exist: {path}"
         rg_bin = self._find_rg()
@@ -453,7 +493,9 @@ class ToolExecutor:
     def readfile(self, file: str,
                  start_line: int | None = None,
                  end_line: int | None = None) -> str:
-        rp = self._real(file)
+        rp, error = self.resolve(file)
+        if error:
+            return error
         if not os.path.isfile(rp):
             return f"Error: file not found: {file}"
         try:
@@ -468,7 +510,9 @@ class ToolExecutor:
         return self._truncate(out)
 
     def tree(self, path: str, levels: int | None = None) -> str:
-        rp = self._real(path)
+        rp, error = self.resolve(path)
+        if error:
+            return error
         if not os.path.isdir(rp):
             return f"Error: dir not found: {path}"
         cmd = ["tree", rp]
@@ -494,13 +538,15 @@ class ToolExecutor:
             for e in entries:
                 fp = os.path.join(p, e)
                 lines.append(f"{pfx}├── {e}")
-                if os.path.isdir(fp) and not e.startswith("."):
+                if os.path.isdir(fp) and not os.path.islink(fp) and not e.startswith("."):
                     walk(fp, pfx + "│   ", d + 1)
         walk(real, "", 0)
         return "\n".join(lines[:300])
 
     def ls(self, path: str, long_format: bool = False, all_files: bool = False) -> str:
-        rp = self._real(path)
+        rp, error = self.resolve(path)
+        if error:
+            return error
         cmd = ["ls"]
         if long_format:
             cmd.append("-l")
@@ -515,8 +561,14 @@ class ToolExecutor:
 
     def glob_cmd(self, pattern: str, path: str, type_filter: str = "all") -> str:
         import glob as gmod
-        rp = self._real(path)
-        matches = gmod.glob(os.path.join(rp, pattern), recursive=True)
+        rp, error = self.resolve(path)
+        if error:
+            return error
+        matches = [
+            m
+            for m in gmod.glob(os.path.join(rp, pattern), recursive=True)
+            if is_path_within_root(self.root, m)
+        ]
         if type_filter == "file":
             matches = [m for m in matches if os.path.isfile(m)]
         elif type_filter == "directory":

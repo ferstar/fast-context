@@ -242,6 +242,8 @@ uv run fast-context extract-key --db-path ~/.local/share/devin/credentials.toml
 
 Auto-discovery checks Devin CLI credentials on Linux/WSL first, then local app databases under `Deviv`, `Devin`, and `Windsurf` app data paths, probing both the canonical and lowercase directory spelling because installers disagree on casing (a Windows Devin install writes `devin`). Current installs may store either classic API keys or session-style credentials such as `devin-session-token$...`. This repo accepts either form as long as Windsurf/Devin accepts it.
 
+Inside WSL the Linux Devin CLI credentials (`~/.local/share/devin/credentials.toml`) are what gets read; a key extracted on the Windows side can return 403 from WSL, in which case run `devin login` inside WSL and retry.
+
 When no source is usable the error lists the paths that were searched. Credentials copied from another host can either be placed at one of those local paths so auto-discovery picks them up, or read directly by pointing `WINDSURF_CREDENTIALS_DB` at the copy.
 
 ## Environment

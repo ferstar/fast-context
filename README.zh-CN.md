@@ -242,6 +242,8 @@ uv run fast-context extract-key --db-path ~/.local/share/devin/credentials.toml
 
 自动发现会先检查 Linux/WSL 下的 Devin CLI credentials，然后再找 `Deviv`、`Devin`、`Windsurf` 本地 app 数据库（规范大小写与小写两种目录名都会探测，因为安装器并不统一，例如 Windows 上的 Devin 会写成 `devin`）。当前安装里，凭据可能是传统 API key，也可能是 `devin-session-token$...` 这种 session 风格 token。只要 Windsurf/Devin 自己接受，这个仓库也会直接接受。
 
+在 WSL 里运行时读的是 Linux 侧的 Devin CLI 凭据（`~/.local/share/devin/credentials.toml`）；从 Windows 侧提取的 key 在 WSL 内可能返回 403，这时应在 WSL 内执行 `devin login` 后重试。
+
 以上来源都不可用时报错会带上实际查找过的路径。如果凭据来自其他主机，可以把拷贝出来的库放到上述任一本地路径让自动发现生效，也可以直接用 `WINDSURF_CREDENTIALS_DB` 指向那个副本。
 
 ## 环境变量

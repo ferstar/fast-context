@@ -108,7 +108,7 @@ uv run --project "$SKILL_DIR" fast-context cache-clear --project "<repo-root>"
 - Prefer file paths plus a few labeled semantic blocks over raw range dumps.
 - Hybrid output can include both remote `Start here` files and local Semble chunk candidates. Treat local chunks as hints unless exact reads confirm them.
 - Local-only Semble results are chunk-level. Use them as precise starting snippets, then open the file when broader context is needed.
-- Include the returned follow-up search terms when they help the next exact search.
+- Follow-up search terms are model-generated hypotheses: deduplicate them, drop the ones you already know, and expect an occasional wrong or sibling-level hit. The ranked candidate files and their line ranges are the reliable part of the output and the better input to `rg`.
 - Add `--verbose` only when you need anchor snippets or config diagnostics.
 - Treat the output as candidate context, not proof. Verification still matters.
 

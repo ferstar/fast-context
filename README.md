@@ -79,7 +79,7 @@ fast-context/
 
 ## Requirements
 
-- Python 3.10 through 3.13 (`>=3.10,<3.14`)
+- Python `>=3.10`
 - `uv`
 - A Windsurf login on the same machine, or `WINDSURF_API_KEY`
 - Semble for local chunk search. `uv sync` installs it as a normal runtime dependency.

@@ -2293,7 +2293,7 @@ def _format_semble_output(
     root = Path(project_root).expanduser().resolve()
     parts = [heading, ""]
     for index, item in enumerate(results, 1):
-        chunk = item.get("chunk") or {}
+        chunk = item.get("chunk") or item
         rel_path = chunk.get("file_path") or ""
         full_path = root / rel_path if rel_path else root
         start = chunk.get("start_line")
@@ -2342,7 +2342,7 @@ def _format_semble_prompt_context(
     ]
     used = sum(len(line) + 1 for line in lines)
     for item in results[:max_chunks]:
-        chunk = item.get("chunk") or {}
+        chunk = item.get("chunk") or item
         path = chunk.get("file_path") or ""
         start = chunk.get("start_line")
         end = chunk.get("end_line")

@@ -79,7 +79,7 @@ fast-context/
 
 ## 环境要求
 
-- Python 3.10 到 3.13（`>=3.10,<3.14`）
+- Python `>=3.10`
 - `uv`
 - 同一台机器上已登录 Windsurf，或者手动设了 `WINDSURF_API_KEY`
 - 需要 Semble 做本地 chunk 搜索；`uv sync` 会把它当普通依赖一起装好

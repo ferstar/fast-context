@@ -26,7 +26,7 @@ Use the bundled Python CLI to get a small set of high-signal candidate files. Th
 ## Workflow
 
 1. Pick the narrowest project root that still contains the relevant code.
-2. Run through `uv` so the skill uses its locked dependencies and Python 3.10-3.13 environment:
+2. Run through `uv` so the skill uses its locked dependencies and Python `>=3.10` environment:
 
 ```bash
 uv run --project "$SKILL_DIR" fast-context search \

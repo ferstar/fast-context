@@ -106,7 +106,7 @@ def _relevant_paths(task: Task) -> list[str]:
 def _local_ranked_paths(payload: dict[str, Any], *, limit: int) -> list[str]:
     paths = []
     for item in payload.get("results") or []:
-        chunk = item.get("chunk") or {}
+        chunk = item.get("chunk") or item
         path = chunk.get("file_path")
         if path:
             paths.append(str(path))

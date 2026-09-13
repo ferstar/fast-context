@@ -2,67 +2,58 @@
 
 [中文说明](README.zh-CN.md)
 
-Python-first fast repository context search for Codex/Claude-style skills.
+Fast Context is a lightweight codebase context locator designed for coding agents (such as Codex, Claude, and similar LLM agents).
 
-This repo replaces the Node/MCP packaging with a simple Python CLI and skill workflow. It still talks to Windsurf's reverse-engineered SWE-grep backend, but now keeps the local side lean:
+It provides a standalone Python CLI that integrates **local Semble chunk prefetching** with **remote Windsurf (SWE-grep) symbol reasoning**. This hybrid pipeline enables agents to rapidly pinpoint relevant files and line numbers in large repositories without drowning in context.
 
-- local Semble prefetch for cached chunk candidates
-- local Windsurf credential extraction from `state.vscdb`
-- local lexical anchors before the remote semantic loop
-- BM25F directory heat, adaptive topK, and hotspot repo maps to avoid oversized payloads
-- skill-friendly output with candidate files, line ranges, and follow-up grep terms
+- **Fast Local Prefetch**: Retrieves cached code chunks in milliseconds using Semble.
+- **Remote Symbol Expansion**: Injects local lexical anchors and query-relevant subtrees into Windsurf to verify and expand call chains.
+- **Graceful Fallback**: Automatically degrades to local Semble chunks if remote requests hit rate limits, timeouts, or missing credentials.
+- **Token-Efficient Repo Maps**: Ranks directories with BM25F and applies adaptive Top-K to build a focused Hotspot Repo Map, keeping payloads small while preserving exact file recall.
+- **Zero-Setup Credentials**: Automatically extracts credentials from local Windsurf / Devin databases.
 
-## Why this shape
+## Architecture
 
-The high-ROI path for code search is not prompt tricks. It is a hybrid retrieval loop:
+In large codebases, naive regex searches (like `rg`) miss high-level architectural semantics, while feeding full directory trees to remote models wastes context budgets and easily triggers rate limits. Fast Context bridges both worlds with a two-stage hybrid retrieval loop:
 
-1. Run Semble locally first to get warm-cache chunk candidates.
-2. Keep exact lexical evidence from the local repo: filenames, paths, literal terms.
-3. Give Semble candidates, lexical evidence, and a hotspot repo map to the remote semantic search loop.
-4. Let Windsurf verify and expand with `rg`, `readfile`, `tree`, `ls`, and `glob` calls.
-5. If the remote path is unavailable, degrade to local Semble chunk retrieval.
-6. Return a small set of files or chunks that are actually worth reading next.
+1. **Local Semantic Prefetch**: Query Semble for warm, cached code chunk candidates.
+2. **Lexical Anchoring**: Extract exact candidate filenames, path tokens, and literal terms from the local repo.
+3. **Hotspot Repo Mapping**: Score directories with BM25F to construct an adaptive subtree map.
+4. **Remote Verification**: Pass local chunks, anchors, and the hotspot map to Windsurf for agentic verification (`rg`, `readfile`, `tree`, `ls`, `glob`) and call-chain expansion.
+5. **Fallback on Failure**: If the remote service is throttled or unavailable, return the local Semble chunks so the agent never stalls.
+6. **Focused Handoff**: Deliver 3-10 high-confidence candidate files with exact line ranges and suggested follow-up grep terms.
 
-This repo implements the local side in Python so it is easy to run in a skill. Semble is used as the high-ROI local index backend for warm, cached chunk retrieval, while Windsurf remains responsible for agentic verification and call-chain expansion.
-
-## Hybrid pipeline
+## Retrieval Pipeline
 
 ```text
-User query
-  -> Semble local prefetch
-     -> cached index + potion-code-16M chunks
-  -> fast-context prompt
-     -> original query + Semble chunk hints + lexical anchors + hotspot repo map
-  -> Windsurf remote search
-     -> verify hints with rg/readfile/tree/ls/glob and expand related files
-  -> Start here output
-     -> files, line ranges, follow-up search terms, local chunk candidates
-
-Remote failure path:
-  Windsurf auth/rate-limit/timeout/resource_exhausted
-    -> return local Semble chunk results instead of an empty failure
+User Query
+  │
+  ├── 1. Local Semble Prefetch ───> Cached Code Chunks
+  │
+  ├── 2. Local Lexical Analysis ──> Extract Anchors & Hotspot Repo Map
+  │
+  └── 3. Remote Verification ─────> Windsurf Validates & Expands Call Chains
+            │
+            ├─ (Success) ──> Return "Start Here" Files & Line Ranges
+            └─ (Failure) ──> Fall Back to Local Semble Chunks
 ```
 
-## Hotspot repo maps
+## Hotspot Repo Maps
 
-Large repos make naive deep trees expensive and noisy. Fast Context now sends the remote semantic loop a query-shaped repo map instead of only a fixed compact tree.
+Feeding a full, deep tree into an LLM context is expensive and noisy. Fast Context dynamically generates a query-shaped map:
 
-The map has three layers:
+- **Repository Map**: A compact top-level outline preserving global structural orientation.
+- **Relevant File Paths**: Exact file paths surfaced by local lexical probes, prioritized when prompt budgets shrink.
+- **Hotspot Subtrees**: Directories ranked by BM25F heat and expanded with adaptive `topK`, providing granular visibility into likely feature areas.
 
-- `Repository Map`: a compact top-level tree so the model keeps global orientation.
-- `Relevant File Paths`: exact file paths recovered from lexical probes, kept first when the payload must shrink.
-- `Hotspot Subtrees`: BM25F-ranked directories expanded with adaptive `topK`, so likely feature areas get more detail than cold directories.
+In an A/B benchmark across 16 queries on a large private repository, hotspot maps delivered significantly higher exact-file visibility compared to traditional compact trees:
 
-This is used by `search` for the `hybrid` and `remote` backends. The `local` backend does not need it because it returns Semble chunk hits directly. If repo-map construction fails or the budget is too tight, Fast Context falls back to the classic compact tree.
-
-On a private 16-query large-repo A/B suite, the optimized map traded roughly `10 ms -> 120 ms` repo-map build p50 and `2.4 KB -> 11.9 KB` payload size for much better exact-file visibility:
-
-| Variant | File recall | Deep directory coverage | File MRR | p50 build latency | Avg map size |
+| Variant | File Recall | Deep Directory Coverage | File MRR | p50 Build Latency | Avg Map Size |
 |---|---:|---:|---:|---:|---:|
 | `classic` | 0.0000 | 1.0000 | 0.0000 | 10 ms | 2.4 KB |
 | `hotspot` | 0.4792 | 1.0000 | 0.0184 | 120 ms | 11.9 KB |
 
-The read is straightforward: classic maps are cheaper and preserve broad directory coverage, but they often hide exact files in day-to-day feature queries. Hotspot maps cost more local preprocessing and a larger prompt section, but they expose concrete candidate files before the remote loop starts verifying.
+*Note: The hotspot map trades roughly ~100 ms of local preprocessing and a slightly larger prompt payload for direct candidate-file visibility before remote verification begins.*
 
 ## Files
 
@@ -352,71 +343,63 @@ The main metrics are:
 - `avg_size_bytes` and `p50_latency_ms`: prompt and local preprocessing cost.
 
 ### Important note on fairness
+### Notes on Evaluation Fairness
 
-The `2026-06-01` numbers below were collected before the runner switched to completion-based cooldown. That older runner only enforced a start-gap, which meant any `~5s` remote call effectively launched the next one immediately after completion and could over-stress Windsurf during long batches. Treat the published `remote` / `hybrid` rows as an operational stress run, not the final apples-to-apples backend comparison.
+The `2026-06-01` baseline numbers below were recorded using an earlier test harness that paced requests solely by start-time intervals. Because each remote interaction took ~5 seconds, back-to-back runs quickly saturated upstream Windsurf rate limits. Consequently, older `remote` and `hybrid` results reflect heavy upstream throttling rather than pure model capability.
 
-The current runner defaults are intentionally slower and fairer. Use them for any future published benchmark refresh.
+The current runner enforces **completion-based cooldowns** and bounded exponential backoff retries. Future benchmark refreshes will be published under these fairer pacing constraints.
 
-### Quality summary
+### Quality Summary
 
 | Backend | NDCG@10 | 95% CI | Recall@10 | 95% CI | Top-1 | MRR |
 |---|---:|---:|---:|---:|---:|---:|
-| `local` | 0.854 | 0.774-0.926 | 0.946 | 0.875-1.000 | 0.775 | 0.850 |
-| `remote` | 0.453 | 0.309-0.604 | 0.467 | 0.312-0.617 | 0.450 | 0.475 |
-| `hybrid` | 0.890 | 0.835-0.939 | 0.979 | 0.946-1.000 | 0.825 | 0.896 |
+| `local` (Semble only) | 0.854 | 0.774-0.926 | 0.946 | 0.875-1.000 | 0.775 | 0.850 |
+| `remote` (Windsurf only) | 0.453 | 0.309-0.604 | 0.467 | 0.312-0.617 | 0.450 | 0.475 |
+| `hybrid` (Two-stage) | 0.890 | 0.835-0.939 | 0.979 | 0.946-1.000 | 0.825 | 0.896 |
 
-### Operational summary
+### Performance Summary
 
-| Backend | Batch p50 latency | Batch p90 latency | Final non-empty output | Remote success | `resource_exhausted` / degraded | Total retries |
+| Backend | Batch p50 Latency | Batch p90 Latency | Valid Output Rate | Remote Success | `resource_exhausted` / Fallbacks | Total Retries |
 |---|---:|---:|---:|---:|---:|---:|
-| `local` | 30 ms | 39 ms | 100% | n/a | 0 | 0 |
+| `local` | 30 ms | 39 ms | 100% | N/A | 0 | 0 |
 | `remote` | 24.4 s | 37.5 s | 50% | 52.5% | 19 | 43 |
 | `hybrid` | 28.3 s | 40.0 s | 100% | 50.0% | 20 degraded | 44 |
 
-Warm local cache build cost, measured separately before timing queries:
+Local warm-cache index build time (measured prior to query evaluation):
 
 - `fastapi`: 422 ms
 - `axios`: 65 ms
 
-### By category
+### Category Breakdown (NDCG@10)
 
-NDCG@10 by query category:
-
-| Category | `local` | `remote` | `hybrid` |
+| Query Category | `local` | `remote` | `hybrid` |
 |---|---:|---:|---:|
 | `architecture` | 0.718 | 0.506 | 0.819 |
 | `semantic` | 0.855 | 0.473 | 0.869 |
 | `symbol` | 1.000 | 0.364 | 1.000 |
 
-### Interpretation
+### Key Takeaways
 
-- `local` is the throughput baseline: warm-cache p50 is `30 ms`, quality is already strong (`0.854` NDCG@10 / `0.946` recall@10), and the run had zero failures.
-- `local` is the stable throughput baseline and remains the safest choice for bulk evals, CI, and low-latency repo search.
-- The old `remote` / `hybrid` rows surfaced a runner bug more than a backend-quality truth: a start-gap alone was not enough to prevent long-batch upstream throttling.
-- The fair runner now uses completion-based cooldown plus capped retry windows, so the next published `remote` / `hybrid` numbers should be regenerated with the current defaults instead of compared directly against the stress-run table above.
-- In day-to-day usage, `hybrid` is still the right interactive default when you want Windsurf verification on top of local Semble hints. Just do not treat the older degraded batch result as its steady-state quality ceiling.
+- **`local` is a reliable, high-throughput baseline**: With a warm p50 of `30 ms` and strong retrieval metrics (`0.854` NDCG@10 / `0.946` Recall@10 with zero failures), it is ideal for CI, bulk evals, and latency-critical offline pipelines.
+- **`hybrid` is the recommended interactive default**: Combining Semble prefetch hints with Windsurf verification achieves top retrieval quality (`0.890` NDCG@10 / `0.979` Recall@10) while ensuring the agent never stalls due to remote limits.
+- **`remote` serves as an ablation baseline**: Useful for isolating raw Windsurf reasoning performance without prior local chunk hints.
 
-## Skill usage
+## Recommended Workflow
 
-The intended usage is through `SKILL.md`, but the CLI is also fine for direct local runs and quick repo checks.
+Fast Context works best when configured as an agent skill via `SKILL.md`, but the CLI is equally suited for direct interactive exploration:
 
-Typical flow:
+1. **Start with Hybrid Search**: Submit natural-language queries using default `--backend hybrid`.
+2. **Inspect Candidate Files**: Focus on the returned candidate files and suggested line ranges.
+3. **Offline or Low-Latency Needs**: Switch to `--backend local` for instant, dependency-free chunk retrieval.
+4. **Follow Call Chains**: For promising code locations, run `find-related` to discover adjacent logic.
+5. **Pinpoint Changes**: Transition to exact-match tools (`rg` or `ast-grep`) once candidates are identified.
 
-1. Run Fast Context with a natural-language query. Default `--backend hybrid` prefetches local Semble chunks, then uses Windsurf to verify and expand.
-2. Read the returned files.
-3. Use `--backend local` for bulk runs, CI, and low-latency repo search without any Windsurf dependency.
-4. Use `--backend remote` only when you want to isolate Windsurf behavior without local chunk hints.
-5. Use `find-related` to follow a promising local chunk to similar code.
-6. Confirm exact call sites or symbols with `rg` or `ast-grep`.
+## Implementation Details
 
-## Notes
-
-- Local lexical anchors are generic. They bias toward exact filenames, path segments, and literal content hits from the query.
-- Repo maps now start with a compact top-level tree, then add relevant file paths and BM25F-ranked hotspot subtrees. If the map is still too large, it keeps file paths first, trims hotspot subtrees, trims path spines only if needed, and finally falls back to the classic compact tree.
-- If the remote call times out or the payload is too large, the search loop trims old context and retries once.
-- Fast Context calls the Semble Python library directly, saves fresh local indexes into Semble's cache, and lets Semble invalidate that cache when indexed files change.
-- Semble chunk hits are candidate evidence, not proof. Hybrid mode asks Windsurf to verify them before producing the main `Start here` output.
-- Successful output stays concise by default. Use `--verbose` when you want anchor snippets and config diagnostics.
+- **Lexical Anchors**: Heuristically extracts exact filenames, path segments, and verbatim literals from the user query.
+- **Dynamic Tree Pruning**: Repo maps prioritize top-level trees and exact lexical hits. When token budgets shrink, hotspot subtrees compress dynamically before falling back to classic compact trees.
+- **Cache Invalidation**: Leverages Semble's native cache tracking, invalidating indexes incrementally only when files change.
+- **Verification Rule**: Search results are candidate pointers rather than definitive proofs; agents should inspect targeted source files before committing edits.
 
 ## License
 

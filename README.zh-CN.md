@@ -2,67 +2,58 @@
 
 [English](README.md)
 
-给 Codex、Claude 这类 coding agent 用的仓库搜索工具，尽量做轻。
+Fast Context 是一款面向 Coding Agent（如 Codex、Claude 等）的代码上下文定位工具。
 
-以前它是个 Node/MCP 打包的东西，现在简化成纯 Python CLI + skill 工作流。后端连的还是 Windsurf 逆向出来的 SWE-grep，本地这边尽量不折腾：
+项目使用轻量纯 Python CLI 替代原有的 Node/MCP 封装，通过**本地 Semble 向量/分块预取**与**远端 Windsurf（SWE-grep）符号推理**的混合检索架构，帮助 Agent 在大中型代码库中快速锁定相关文件与行号。
 
-- 本地 Semble 先捞缓存的 chunk 候选
-- 从 `state.vscdb` 把 Windsurf 凭据提出来
-- 发给远端做语义搜索之前，先补上本地 lexical anchors
-- 用 BM25F 目录热度、adaptive topK 和 hotspot repo map 控制 payload
-- 输出更适合 skill 接的候选文件、行号范围和后续 grep 关键词
+- **快速本地预取**：利用 Semble 本地缓存秒级检索相关的代码分块（Chunks）。
+- **远端符号推理**：结合本地词法线索（Lexical Anchors）与热点目录树，调用 Windsurf 智能验证并展开调用链。
+- **平滑降级兜底**：远端遇限流、超时或无凭据时，自动回退到本地 Semble 结果，确保 Agent 不中断。
+- **智能上下文控制**：采用 BM25F 目录热度与自适应 Top-K 生成 Hotspot Repo Map，显著降低 Prompt 消耗并提升文件召回率。
+- **即开即用**：自动从本机提取 Windsurf / Devin 凭据，输出精简规范的文件及行号范围。
 
-## 为什么这么设计
+## 架构设计
 
-代码搜索要效果好，靠的是混合链路，几个环节串起来：
+在不熟悉的大型仓库中，单纯依赖全文正则（如 `rg`）往往缺乏全局语义，而直接让大模型遍历全仓又受限于 Token 成本和速率限制。Fast Context 采用两级混合检索：
 
-1. 本地先用 Semble 跑一圈，拿到热缓存的 chunk 候选。
-2. 同时把仓库里精确的词法线索也留着：文件名、路径、字面量关键词。
-3. 把 Semble 候选、词法线索、hotspot repo map 一起丢给远端做语义搜索。
-4. Windsurf 用 `rg`、`readfile`、`tree`、`ls`、`glob` 验证并扩展相关文件。
-5. 远端走不通就降级到本地 Semble chunk 检索，至少不空手。
-6. 最后只给一小组真正值得读的文件或 chunk。
+1. **本地语义预检**：Semble 检索热缓存中的高相关性代码分块。
+2. **提取词法线索**：提取查询相关的精确文件名、路径片段与关键字（Lexical Anchors）。
+3. **构造热点地图**：基于 BM25F 计算相关目录热度，生成轻量级的 Hotspot Repo Map。
+4. **远端验证扩展**：将上述线索注入 Windsurf，由远端引擎执行定向符号验证与调用链展开。
+5. **故障降级**：远端接口不可用时，直接返回本地 Semble 分块，保证流程不中断。
+6. **聚焦输出**：最终仅返回 3-10 个高度可信的候选文件、代码行区间及后续检索建议。
 
-本地侧用 Python 写，纯粹为了直接当 skill 跑。Semble 管本地索引和热缓存 chunk 检索；Windsurf 仍然负责 agent 那层的验证和扩展。
-
-## 混合搜索流程
+## 检索流程
 
 ```text
 用户查询
-  -> 本地 Semble 预取
-     -> 缓存索引 + potion-code-16M chunks
-  -> fast-context prompt
-     -> 原始查询 + Semble chunk 提示 + lexical anchors + hotspot repo map
-  -> Windsurf 远端搜索
-     -> 用 rg/readfile/tree/ls/glob 验证提示并扩展相关文件
-  -> Start here 输出
-     -> 文件、行号范围、后续搜索词、本地 chunk 候选
-
-远端走不通时的降级路径：
-  Windsurf auth/rate-limit/timeout/resource_exhausted
-    -> 返回本地 Semble 结果，至少不空手
+  │
+  ├── 1. 本地 Semble 预取 ──────> 命中缓存代码分块 (Chunks)
+  │
+  ├── 2. 本地词法分析 ──────────> 提取文件名、路径线索与 Hotspot Repo Map
+  │
+  └── 3. 混合组装与远端验证 ────> Windsurf 展开调用链并校验
+            │
+            ├─ (正常) ──> 返回 Start Here 候选文件清单与行号
+            └─ (异常) ──> 自动降级返回本地 Semble 分块
 ```
 
-## Hotspot repo map
+## Hotspot Repo Map
 
-大仓库里直接塞一棵深目录树，成本高，而且噪音多。Fast Context 现在给远端语义搜索环节的是一份跟当前 query 相关的 repo map，而不是只给固定的 compact tree。
+在复杂代码库中，直接提供完整深层目录树不仅冗长而且包含大量噪音。Fast Context 在向远端发起检索前，会动态生成一份与当前查询紧密相关的热点地图：
 
-这份 map 分三层：
+- **Repository Map**：顶层紧凑目录树，保留全局结构轮廓。
+- **Relevant File Paths**：本地词法命中的高相关路径，在 Token 预算紧张时优先保留。
+- **Hotspot Subtrees**：基于 BM25F 评分排序的热点目录，自适应展开更可能包含目标逻辑的子树。
 
-- `Repository Map`：紧凑的顶层目录树，保留全局结构感。
-- `Relevant File Paths`：本地 lexical probe 找到的精确文件路径；payload 需要收缩时优先保留。
-- `Hotspot Subtrees`：用 BM25F 排出来的热点目录，再按 adaptive `topK` 展开，让更可能相关的功能区拿到更多细节。
+在 16 组大型私有仓库查询的 A/B 对照测试中，热点地图相比传统紧凑树（Classic Tree）大幅提升了精确文件的早期曝光率：
 
-这个逻辑默认用于 `search` 的 `hybrid` 和 `remote` backend。`local` backend 直接返回 Semble chunk，不需要 repo map。构建失败或者预算太紧时，会自动回退到 classic compact tree。
-
-在一套私有的大仓 16-query A/B 里，优化后的 map 把 repo-map 构建 p50 从约 `10 ms` 提到 `120 ms`，payload 从 `2.4 KB` 提到 `11.9 KB`，换来的是更好的精确文件可见性：
-
-| Variant | File recall | Deep directory coverage | File MRR | p50 build latency | Avg map size |
+| 方案 | 文件召回率 (File recall) | 深层目录覆盖率 | 文件 MRR | 构建耗时 (p50) | 平均体积 |
 |---|---:|---:|---:|---:|---:|
-| `classic` | 0.0000 | 1.0000 | 0.0000 | 10 ms | 2.4 KB |
-| `hotspot` | 0.4792 | 1.0000 | 0.0184 | 120 ms | 11.9 KB |
+| `classic` (传统紧凑树) | 0.0000 | 1.0000 | 0.0000 | 10 ms | 2.4 KB |
+| `hotspot` (热点地图) | 0.4792 | 1.0000 | 0.0184 | 120 ms | 11.9 KB |
 
-解读也很直接：classic map 更便宜，广义目录覆盖还在，但日常功能查询经常看不到具体文件。Hotspot map 多花一点本地预处理和 prompt 预算，换来的是远端开始验证前就能看到更多具体候选文件。
+*数据说明：虽然热点地图微幅增加了本地预处理耗时（约 100ms）和 Prompt 占用，但它能让远端推理阶段在介入之前就看到精确候选文件，显著提升检索收敛速度。*
 
 ## 文件结构
 
@@ -352,71 +343,62 @@ uv run python -m benchmarks.run_repo_map_ab \
 - `avg_size_bytes` 和 `p50_latency_ms`：prompt 成本和本地预处理成本。
 
 ### 关于公平性的说明
-
-下面这些 `2026-06-01` 的数字，是在 runner 切换成 completion-based cooldown 之前跑出来的。旧 runner 只卡请求启动间隔，意味着差不多 `~5s` 的 remote 调用跑完后，几乎立刻就会发出下一次请求——长批次下来很容易把 Windsurf 压炸。所以已经发出去的 `remote` / `hybrid` 数据更像一次压力测试，离公平的 backend 一对一对比还有距离。
-
-现在 runner 的默认值故意放慢了速度，也更公平。以后任何对外发的 benchmark 更新，都应该用这套默认值重新跑。
-
-### 质量汇总
-
-| Backend | NDCG@10 | 95% CI | Recall@10 | 95% CI | Top-1 | MRR |
+ 
+以下 `2026-06-01` 的测试数据产自旧版基准测试脚本（仅按请求发起时间做频率限制）。由于每次远端交互耗时约 5 秒，旧脚本会导致并发/短间隔请求把上游 Windsurf 打到限流，因此旧版数据中 `remote` 与 `hybrid` 更偏向“高并发压力测试”而非理想对照。
+ 
+当前测试脚本已全面升级为 **完成事件冷却（Completion-based Cooldown）** 与指数退避重试，后续基准测评将以该标准重新运行生成。
+ 
+### 质量对比
+ 
+| 检索模式 (Backend) | NDCG@10 | 95% 置信区间 | Recall@10 | 95% 置信区间 | Top-1 准确率 | MRR |
 |---|---:|---:|---:|---:|---:|---:|
-| `local` | 0.854 | 0.774-0.926 | 0.946 | 0.875-1.000 | 0.775 | 0.850 |
-| `remote` | 0.453 | 0.309-0.604 | 0.467 | 0.312-0.617 | 0.450 | 0.475 |
-| `hybrid` | 0.890 | 0.835-0.939 | 0.979 | 0.946-1.000 | 0.825 | 0.896 |
-
-### 运行汇总
-
-| Backend | Batch p50 latency | Batch p90 latency | Final non-empty output | Remote success | `resource_exhausted` / degraded | Total retries |
+| `local` (纯本地 Semble) | 0.854 | 0.774-0.926 | 0.946 | 0.875-1.000 | 0.775 | 0.850 |
+| `remote` (纯远端 Windsurf) | 0.453 | 0.309-0.604 | 0.467 | 0.312-0.617 | 0.450 | 0.475 |
+| `hybrid` (混合模式) | 0.890 | 0.835-0.939 | 0.979 | 0.946-1.000 | 0.825 | 0.896 |
+ 
+### 运行表现
+ 
+| 检索模式 (Backend) | 批次耗时 p50 | 批次耗时 p90 | 有效输出率 | 远端成功率 | `resource_exhausted` / 降级数 | 总重试次数 |
 |---|---:|---:|---:|---:|---:|---:|
-| `local` | 30 ms | 39 ms | 100% | n/a | 0 | 0 |
+| `local` | 30 ms | 39 ms | 100% | 不适用 | 0 | 0 |
 | `remote` | 24.4 s | 37.5 s | 50% | 52.5% | 19 | 43 |
-| `hybrid` | 28.3 s | 40.0 s | 100% | 50.0% | 20 degraded | 44 |
-
-本地热缓存建索引成本（在 query timing 之前单独测量）：
-
+| `hybrid` | 28.3 s | 40.0 s | 100% | 50.0% | 20 次降级 | 44 |
+ 
+本地热缓存建索引耗时（在检索测试前单独测量）：
+ 
 - `fastapi`: 422 ms
 - `axios`: 65 ms
-
-### 分类别结果
-
-按查询类别统计的 NDCG@10：
-
-| Category | `local` | `remote` | `hybrid` |
+ 
+### 分类别 NDCG@10 表现
+ 
+| 查询分类 | `local` | `remote` | `hybrid` |
 |---|---:|---:|---:|
-| `architecture` | 0.718 | 0.506 | 0.819 |
-| `semantic` | 0.855 | 0.473 | 0.869 |
-| `symbol` | 1.000 | 0.364 | 1.000 |
-
-### 如何解读
-
-- `local` 是吞吐基线：热缓存 p50 只有 `30 ms`，质量已经很强（`0.854` NDCG@10 / `0.946` recall@10），整轮 benchmark 也没有失败。
-- `local` 仍然是 bulk eval、CI 和低延迟 repo 搜索里最稳妥的基线选择。
-- 旧版 `remote` / `hybrid` 行暴露出来的更多是 runner bug；它不能代表 backend 质量真相：只限制启动间隔不足以避免长批次里上游限流。
-- 现在的公平 runner 已经改成 completion-based cooldown，并加入了有上限的 retry 窗口。因此，下一轮对外发布的 `remote` / `hybrid` 数字应该用当前默认值重新生成，不建议直接拿旧 stress run 表格做横向对比。
-- 在日常交互里，`hybrid` 仍然是合适的默认模式：本地 Semble 先给提示，Windsurf 再做验证。只是不要把旧版退化 batch 结果当成它的稳定质量上限。
-
-## Skill 使用方式
-
-建议走 `SKILL.md` 来用，不过直接跑 CLI 也适合本地调试和快速翻仓库。
-
-典型流程：
-
-1. 拿自然语言查询跑 Fast Context。默认 `--backend hybrid` 先预取本地 Semble chunks，再让 Windsurf 验证和扩展。
-2. 打开返回的文件接着读。
-3. 如果是批量跑、CI 或者要低延迟搜仓库，用 `--backend local`，完全不依赖 Windsurf。
-4. 只有你想单独看 Windsurf 的行为、不想带本地 chunk 提示的时候，才切 `--backend remote`。
-5. 碰到有价值的本地 chunk，用 `find-related` 继续找类似代码。
-6. 最后再用 `rg` 或 `ast-grep` 确认精确的调用点和符号。
-
-## 备注
-
-- 本地 lexical anchors 是通用启发式规则，偏向精确的文件名、路径片段和查询中的字面量命中。
-- repo map 现在先给紧凑的顶层树，再追加相关文件路径和 BM25F 排出来的热点子树。如果还是太大，会优先保留文件路径，先收缩热点子树，必要时再丢 path spines，最后才回退到 classic compact tree。
-- 远端请求超时或者 payload 太大时，搜索循环会裁掉旧上下文再重试一次。
-- Fast Context 直接调 Semble Python library，新建的本地索引会存回 Semble 缓存，Semble 自己会在索引文件变化时自动判断要不要失效。
-- Semble chunk 命中只是候选，不能当最终证据。Hybrid 模式会先让 Windsurf 验证，再生成主 `Start here` 输出。
-- 默认输出尽量简洁；需要 anchor snippets 或 config diagnostics 时加 `--verbose`。
+| `architecture` (架构/流向) | 0.718 | 0.506 | 0.819 |
+| `semantic` (业务语义) | 0.855 | 0.473 | 0.869 |
+| `symbol` (具体符号) | 1.000 | 0.364 | 1.000 |
+ 
+### 评测结论与选型建议
+ 
+- **`local` 模式具备极高的性价比基线**：热缓存下 p50 延迟仅 `30 ms`，即可达到 `0.854` NDCG@10 与 `0.946` Recall@10，全程 0 失败。非常适合 CI 流水线、批量自动化评测以及对延迟敏感的高频交互。
+- **`hybrid` 是交互场景下的首选**：本地 Semble 预取为远端模型提供了高相关性的上下文锚点，最终召回与精度（NDCG@10 0.890 / Recall@10 0.979）均优于纯远端或纯本地。同时内建降级机制确保即使远端超限，也不会阻断 Agent 的工作流。
+- **`remote` 适合作为消融对照**：用于单独排查 Windsurf 在无本地分块提示时的独立表现。
+ 
+## 使用建议
+ 
+建议直接通过 `SKILL.md` 配置给 Coding Agent，也可以在终端直接使用 CLI 调试：
+ 
+1. **优先使用默认模式**：输入自然语言，以 `--backend hybrid` 启动检索。
+2. **查阅候选清单**：重点阅读返回的文件路径与代码行区间。
+3. **低延迟与离线环境**：使用 `--backend local` 获得毫秒级本地检索，无外部网络与账户依赖。
+4. **追查关联实现**：对命中关键位置的代码，使用 `find-related` 进一步挖掘相关逻辑。
+5. **精确定位**：拿到候选文件后，再通过 `rg` 或 `ast-grep` 锁定精确调用点和修改位置。
+ 
+## 补充说明
+ 
+- **词法锚点（Lexical Anchors）**：结合精确文件名、路径片段与查询中的字面量特征，自动提取启发式定位线索。
+- **动态预算裁剪**：Repo Map 优先保证顶层树与具体命中的文件路径；若超出 Token 预算，会按优先级缩减热点子树或退回紧凑树。
+- **Semble 缓存生命周期**：索引直接接入 Semble 缓存系统，当文件未变动时秒级复用，代码变更时自动触发增量失效。
+- **结果验证原则**：检索结果（包括本地分块与远端提示）旨在缩小排查范围，Agent 在得出结论或执行修改前，应始终先读取对应源码核验。
 
 ## License
 

@@ -80,7 +80,7 @@ dependencies = [
 ]
 
 [package.metadata]
-requires-dist = [{ name = "semble", specifier = ">=0.6.0" }]
+requires-dist = [{ name = "semble", specifier = "~=0.6.0" }]
 
 [[package]]
 name = "filelock"

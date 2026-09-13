@@ -394,6 +394,17 @@ Fast Context works best when configured as an agent skill via `SKILL.md`, but th
 4. **Follow Call Chains**: For promising code locations, run `find-related` to discover adjacent logic.
 5. **Pinpoint Changes**: Transition to exact-match tools (`rg` or `ast-grep`) once candidates are identified.
 
+## Data & Privacy
+
+Fast Context is designed with strict data isolation and privacy boundaries in mind:
+
+- **Fully Offline Local Search (`--backend local`)**:
+  - Indexing and retrieval run entirely on your local machine using Semble, generating **zero external network requests**. All chunks and caches stay on local disk. Ideal for air-gapped environments, proprietary source code, or strict corporate compliance.
+- **Hybrid & Remote Modes (`--backend hybrid` / `remote`)**:
+  - **Path Sanitization**: Real local file paths (such as `/Users/.../project`) are masked and remapped to virtual `/codebase` paths before any payload leaves your machine, preventing local usernames and filesystem structures from leaking.
+  - **No Full Repository Uploads**: Fast Context never bundles or uploads entire repositories. It only transmits the query, masked directory outlines (Repo Map), lexical anchor tokens, and bounded snippets retrieved by restricted `rg` / `readfile` commands requested by the remote model during active verification rounds.
+  - **Sandboxed Execution**: Model-directed inspection commands (`rg`, `readfile`, `ls`, `tree`, `glob`) execute strictly locally and are clamped within the project root directory, preventing directory traversal or reading files outside the project.
+
 ## Implementation Details
 
 - **Lexical Anchors**: Heuristically extracts exact filenames, path segments, and verbatim literals from the user query.

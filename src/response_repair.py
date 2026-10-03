@@ -26,8 +26,16 @@ def repair_json_text(text: str) -> str:
     text = re.sub(r'([{,]\s*)([A-Za-z_$][\w$-]*)"\s*:', r'\1"\2":', text)
     text = re.sub(r'([{,]\s*)([A-Za-z_$][\w$-]*)\s*:', r'\1"\2":', text)
     # `"start": 350` sometimes degrades to `"start_350` (the `": ` separator
-    # collapses into the underscore); only fires when no value follows.
-    text = re.sub(r'([{,]\s*)"([A-Za-z_$][\w$-]*)_(-?\d+)(?=\s*[,}])', r'\1"\2": \3', text)
+    # collapses into the underscore); only fires when no value follows. The
+    # executor consumes start_line/end_line, so remap the model's aliases.
+    def _remap_collapse(match: re.Match) -> str:
+        prefix, key, value = match.group(1), match.group(2), match.group(3)
+        field = {"start": "start_line", "end": "end_line"}.get(key, key)
+        return f'{prefix}"{field}": {value}'
+
+    text = re.sub(
+        r'([{,]\s*)"([A-Za-z_$][\w$-]*)_(-?\d+)(?=\s*[,}])', _remap_collapse, text
+    )
     text = re.sub(r',\s*([}\]])', r'\1', text)
     return text
 

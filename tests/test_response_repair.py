@@ -45,7 +45,7 @@ class RepairJsonTextTest(unittest.TestCase):
             parse_json_with_repair(
                 '{"type": "readfile", "file": "/codebase/a.py", "start_4, "end_9}'
             ),
-            {"type": "readfile", "file": "/codebase/a.py", "start": 4, "end": 9},
+            {"type": "readfile", "file": "/codebase/a.py", "start_line": 4, "end_line": 9},
         )
 
     def test_unterminated_string_is_unrecoverable(self) -> None:
@@ -74,9 +74,9 @@ class SalvageRestrictedExecArgsTest(unittest.TestCase):
         # 3 structured commands survive; the loose layer then re-adds the
         # collapsed readfiles as plain (range-less) duplicates under new keys.
         self.assertEqual(len(args), 5)
-        self.assertEqual(args["command1"]["start"], 350)
+        self.assertEqual(args["command1"]["start_line"], 350)
         self.assertEqual(args["command2"]["pattern"], "line.*score")
-        plain = [c for c in args.values() if c.get("type") == "readfile" and "start" not in c]
+        plain = [c for c in args.values() if c.get("type") == "readfile" and "start_line" not in c]
         self.assertEqual(len(plain), 2)
 
     def test_loose_readfile_does_not_clobber_structured_command(self) -> None:

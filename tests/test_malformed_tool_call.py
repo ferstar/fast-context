@@ -80,8 +80,8 @@ class ParseToolCallTest(unittest.TestCase):
         self.assertEqual(name, "restricted_exec")
         self.assertEqual(len(args), 8)
         self.assertEqual(args["command1"]["file"], "/codebase/src/homework_print_prep/orient.py")
-        self.assertEqual(args["command1"]["start"], 350)
-        self.assertEqual(args["command1"]["end"], 450)
+        self.assertEqual(args["command1"]["start_line"], 350)
+        self.assertEqual(args["command1"]["end_line"], 450)
         self.assertEqual(args["command4"]["pattern"], "line.*score")
 
     def test_truncated_payload_is_flagged_malformed(self) -> None:

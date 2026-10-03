@@ -326,6 +326,10 @@ def resolve_within_root(root: str, value: str) -> Tuple[str | None, str | None]:
     return os.path.realpath(candidate), None
 
 
+def _valid_str(value: Any) -> bool:
+    return isinstance(value, str) and bool(value)
+
+
 class ToolExecutor:
     """在本地项目目录执行 SWE-grep 的受限工具命令。"""
     def __init__(self, project_root: str) -> None:
@@ -577,32 +581,50 @@ class ToolExecutor:
         return out or "(no matches)"
 
     def exec_command(self, cmd: Dict[str, Any]) -> str:
+        # The remote model occasionally emits tool calls whose args parsed as
+        # JSON but carry missing or wrong-typed fields; answer with an error
+        # string so the model sees it and can retry instead of crashing here.
+        if not isinstance(cmd, dict):
+            return "Error: missing or invalid command"
         t = cmd.get("type", "")
         if t == "rg":
+            if not _valid_str(cmd.get("pattern")):
+                return "Error: missing or invalid pattern"
+            if not _valid_str(cmd.get("path")):
+                return "Error: missing or invalid path"
             return self.rg(cmd["pattern"], cmd["path"], cmd.get("include"), cmd.get("exclude"))
         if t == "readfile":
+            if not _valid_str(cmd.get("file")):
+                return "Error: missing or invalid file path"
             return self.readfile(cmd["file"], cmd.get("start_line"), cmd.get("end_line"))
         if t == "tree":
+            if not _valid_str(cmd.get("path")):
+                return "Error: missing or invalid path"
             return self.tree(cmd["path"], cmd.get("levels"))
         if t == "ls":
+            if not _valid_str(cmd.get("path")):
+                return "Error: missing or invalid path"
             return self.ls(cmd["path"], cmd.get("long_format", False), cmd.get("all", False))
         if t == "glob":
+            if not _valid_str(cmd.get("pattern")):
+                return "Error: missing or invalid pattern"
+            if not _valid_str(cmd.get("path")):
+                return "Error: missing or invalid path"
             return self.glob_cmd(cmd["pattern"], cmd["path"], cmd.get("type_filter", "all"))
         return f"Error: unknown command type '{t}'"
 
     def exec_tool_call(self, args: Dict[str, Any]) -> str:
         parts: list[str] = []
         for key in sorted(args.keys()):
-            if key.startswith("command") and isinstance(args[key], dict):
+            if key.startswith("command"):
+                # Non-dict commands still get an error result so the model
+                # learns the call was rejected instead of seeing silence.
                 output = self.exec_command(args[key])
                 parts.append(f"<{key}_result>\n{output}\n</{key}_result>")
         return "".join(parts)
 
     def exec_tool_call_async(self, args: Dict[str, Any]) -> str:
-        keys = [
-            key for key in sorted(args.keys())
-            if key.startswith("command") and isinstance(args[key], dict)
-        ]
+        keys = [key for key in sorted(args.keys()) if key.startswith("command")]
         if not keys:
             return ""
 
@@ -781,6 +803,17 @@ SYSTEM_PROMPT_TEMPLATE = (
 
 FINAL_FORCE_ANSWER = (
     "You have no turns left. Now you MUST provide your final ANSWER, even if it's not complete."
+)
+
+# The remote model occasionally emits a [TOOL_CALLS] block whose [ARGS] JSON is
+# corrupted at generation time (e.g. `"start": 350` degraded to `"start_350`).
+# Feed the rejection back so the agent re-issues the call; cap the retries so a
+# persistently broken model output still ends the search.
+MAX_MALFORMED_FEEDBACK = 2
+
+MALFORMED_TOOL_CALL_HINT = (
+    "Your previous tool call was rejected: the [ARGS] JSON was malformed. "
+    "Re-issue the tool call with valid JSON, or provide your final ANSWER."
 )
 
 
@@ -1539,7 +1572,14 @@ def _build_request(
 
 # ─── 响应解析 ──────────────────────────────────────────────
 
-def _parse_tool_call(text: str) -> Optional[Tuple[str, str, Dict]]:
+# _parse_tool_call outcomes:
+#   None                       -> no [TOOL_CALLS] marker; text is a final answer
+#   _MALFORMED                  -> marker present but ARGS JSON is unparseable
+#   (thinking, name, args)      -> well-formed tool call
+_MALFORMED = "__malformed_tool_call__"
+
+
+def _parse_tool_call(text: str) -> Optional[object]:
     text = text.replace("</s>", "")
     m = re.search(r"\[TOOL_CALLS\](\w+)\[ARGS\](\{.+)", text, re.DOTALL)
     if not m:
@@ -1560,12 +1600,12 @@ def _parse_tool_call(text: str) -> Optional[Tuple[str, str, Dict]]:
     try:
         args = json.loads(raw[:end])
     except json.JSONDecodeError:
-        return None
+        return _MALFORMED
     thinking = text[: m.start()].strip()
     return thinking, name, args
 
 
-def _parse_response(data: bytes) -> Tuple[str, Optional[Tuple[str, Dict]]]:
+def _parse_response(data: bytes) -> Tuple[str, Optional[Tuple[str, Dict]], bool]:
     frames = connect_frames_decode(data)
     all_text = ""
     for frame_data in frames:
@@ -1576,7 +1616,7 @@ def _parse_response(data: bytes) -> Tuple[str, Optional[Tuple[str, Dict]]]:
                 if "error" in err_obj:
                     code = err_obj["error"].get("code", "unknown")
                     msg = err_obj["error"].get("message", "")
-                    return f"[Error] {code}: {msg}", None
+                    return f"[Error] {code}: {msg}", None, False
         except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
             pass
         # 直接从帧数据提取文本（绕过 protobuf 嵌套问题）
@@ -1589,10 +1629,12 @@ def _parse_response(data: bytes) -> Tuple[str, Optional[Tuple[str, Dict]]]:
                 all_text += s
 
     parsed = _parse_tool_call(all_text)
+    if parsed == _MALFORMED:
+        return all_text, None, True
     if parsed:
         thinking, name, args = parsed
-        return thinking, (name, args)
-    return all_text, None
+        return thinking, (name, args), False
+    return all_text, None, False
 
 
 # ─── 核心搜索 ──────────────────────────────────────────────
@@ -1705,6 +1747,7 @@ def _search_once(
     ]
 
     total_api_calls = max_turns + 1
+    malformed_turns = 0
 
     for turn in range(total_api_calls):
         log(f"{model}: 轮次 {turn + 1}/{total_api_calls}")
@@ -1737,7 +1780,7 @@ def _search_once(
                     "_meta": build_meta(error_code=err.code),
                 }
 
-        thinking, tool_info = _parse_response(resp_data)
+        thinking, tool_info, malformed = _parse_response(resp_data)
 
         if tool_info is None:
             if thinking.startswith("[Error]"):
@@ -1746,10 +1789,21 @@ def _search_once(
                     "error": thinking,
                     "_meta": build_meta(error_code=_extract_inline_error_code(thinking)),
                 }
+            if malformed:
+                malformed_turns += 1
+                if malformed_turns <= MAX_MALFORMED_FEEDBACK:
+                    log(
+                        f"{model}: 工具调用 ARGS JSON 畸形，回喂错误重试 "
+                        f"({malformed_turns}/{MAX_MALFORMED_FEEDBACK})"
+                    )
+                    messages.append({"role": 2, "content": thinking})
+                    messages.append({"role": 1, "content": MALFORMED_TOOL_CALL_HINT})
+                    continue
+            extra = {"malformed_tool_calls": malformed_turns} if malformed_turns else {}
             return {
                 "files": [],
                 "raw_response": thinking,
-                "_meta": build_meta(),
+                "_meta": build_meta(**extra),
             }
 
         tool_name, tool_args = tool_info

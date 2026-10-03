@@ -38,6 +38,11 @@ from urllib.request import Request, urlopen
 
 from local_repo_map import build_classic_repo_map, build_optimized_repo_map
 from local_semble import SembleUnavailable, find_related as semble_find_related, search as semble_search
+from response_repair import (
+    parse_json_with_repair,
+    salvage_restricted_exec_args,
+    salvage_search_evidence,
+)
 
 
 # ─── SSL ────────────────────────────────────────────────────
@@ -1604,9 +1609,12 @@ def _parse_tool_call(text: str) -> Optional[object]:
                 break
     if end == 0:
         end = len(raw)
-    try:
-        args = json.loads(raw[:end])
-    except json.JSONDecodeError:
+    # Repair-first: a textual fix keeps the turn executable without burning a
+    # retry; command salvage is the last resort before flagging malformed.
+    args = parse_json_with_repair(raw[:end])
+    if args is None and name == "restricted_exec":
+        args = salvage_restricted_exec_args(raw[:end])
+    if args is None:
         return _MALFORMED
     thinking = text[: m.start()].strip()
     return thinking, name, args
@@ -1807,6 +1815,19 @@ def _search_once(
                     messages.append({"role": 1, "content": MALFORMED_TOOL_CALL_HINT})
                     continue
             extra = {"malformed_tool_calls": malformed_turns} if malformed_turns else {}
+            salvaged = salvage_search_evidence(thinking, project_root)
+            if salvaged["files"] or salvaged["rg_patterns"]:
+                log(
+                    f"{model}: 从畸形响应抢救出 {len(salvaged['files'])} 个文件线索、"
+                    f"{len(salvaged['rg_patterns'])} 个 rg 模式"
+                )
+                return {
+                    "files": [],
+                    "salvaged": salvaged,
+                    "rg_patterns": list(dict.fromkeys(executor.collected_rg_patterns)),
+                    "raw_response": thinking,
+                    "_meta": build_meta(salvaged_response=True, **extra),
+                }
             return {
                 "files": [],
                 "raw_response": thinking,
@@ -1821,6 +1842,12 @@ def _search_once(
             result = _parse_answer(answer_xml, project_root)
             result["rg_patterns"] = list(dict.fromkeys(executor.collected_rg_patterns))
             result["_meta"] = build_meta()
+            if not result["files"]:
+                salvaged = salvage_search_evidence(answer_xml, project_root)
+                if salvaged["files"] or salvaged["rg_patterns"]:
+                    log(f"{model}: 空答案，从响应文本抢救出 {len(salvaged['files'])} 个文件线索")
+                    result["salvaged"] = salvaged
+                    result["_meta"] = build_meta(salvaged_response=True)
             return result
 
         if tool_name == "restricted_exec":
@@ -2264,9 +2291,14 @@ def _format_success_output(
     timeout_ms: int,
     exclude_paths: list[str] | None,
     verbose: bool,
+    salvaged: dict[str, Any] | None = None,
 ) -> str:
     query_terms = _extract_query_terms(query, max_terms=12)
-    signal_patterns = _filter_signal_patterns(rg_patterns, query_terms)
+    salvaged_files = (salvaged or {}).get("files") or []
+    salvaged_patterns = (salvaged or {}).get("rg_patterns") or []
+    signal_patterns = _filter_signal_patterns(
+        list(rg_patterns) + list(salvaged_patterns), query_terms
+    )
     parts: list[str] = []
 
     if files:
@@ -2285,11 +2317,30 @@ def _format_success_output(
                 if anchor:
                     parts.append(f"     anchor: {anchor}")
             parts.append("")
-    elif signal_patterns:
-        parts.append("No direct file matches found.")
+
+    if salvaged_files:
+        parts.append("Salvaged from malformed remote response (low confidence):")
         parts.append("")
-    else:
-        return f"No relevant files found.\n\nRaw response:\n{raw_response}" if raw_response else "No relevant files found."
+        for index, entry in enumerate(salvaged_files, 1):
+            parts.append(f"{index}. {entry['full_path']}")
+            try:
+                with open(entry["full_path"], "r", encoding="utf-8", errors="replace") as handle:
+                    lines = handle.readlines()
+            except OSError:
+                lines = []
+            for start, end in _coalesce_ranges(entry.get("ranges") or []):
+                summary, anchor = _summarize_range(lines, start, end, query_terms, verbose)
+                parts.append(f"   - {summary}")
+                if anchor:
+                    parts.append(f"     anchor: {anchor}")
+            parts.append("")
+
+    if not files and not salvaged_files:
+        if signal_patterns:
+            parts.append("No direct file matches found.")
+            parts.append("")
+        else:
+            return f"No relevant files found.\n\nRaw response:\n{raw_response}" if raw_response else "No relevant files found."
 
     if signal_patterns:
         parts.append("Follow-up search terms:")
@@ -2604,6 +2655,7 @@ def search_with_content(
         timeout_ms=timeout_ms,
         exclude_paths=exclude_paths,
         verbose=verbose,
+        salvaged=result.get("salvaged"),
     )
     if backend == "hybrid" and local_payload and (local_payload.get("results") or []):
         local_output = _format_semble_output(

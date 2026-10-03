@@ -12,8 +12,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 import core  # noqa: E402
 
 # Captured from a live remote search (2026-10): the backend model dropped the
-# `": ` key/value separators while generating the ARGS JSON, so the payload
-# carries the [TOOL_CALLS] marker but is not parseable JSON.
+# `": ` key/value separators while generating the ARGS JSON. Repairable now —
+# parse_json_with_repair turns this back into valid JSON in one pass.
 MALFORMED_PAYLOAD = (
     '[TOOL_CALLS]restricted_exec[ARGS]{"command1": {"type": "readfile", '
     '"file": "/codebase/src/homework_print_prep/orient.py", "start_350, "end_450}, '
@@ -24,6 +24,12 @@ MALFORMED_PAYLOAD = (
     '"command6": {"type": "rg", "pattern": "stamp.*frame", "path": "/codebase/tests", "exclude": ["test_*"]}, '
     '"command7": {"type": "readfile", "file": "/codebase/src/homework_print_prep/stamps_wipe.py", "start_1, "end": 100}, '
     '"command8": {"type": "rg", "pattern": "perspective", "path": "/codebase/tests", "exclude": []}}</s>'
+)
+
+# Truncated mid-string: no repair rule can close an unterminated string and
+# nothing salvageable (no closed file path, no pattern) survives.
+UNRECOVERABLE_PAYLOAD = (
+    '[TOOL_CALLS]restricted_exec[ARGS]{"command1": {"type": "readfile", "file": "/cod'
 )
 
 ANSWER_PAYLOAD = (
@@ -66,11 +72,23 @@ class ParseToolCallTest(unittest.TestCase):
     def test_missing_marker_is_final_answer(self) -> None:
         self.assertIsNone(core._parse_tool_call("<ANSWER>done</ANSWER>"))
 
-    def test_captured_malformed_payload_is_flagged(self) -> None:
-        self.assertEqual(core._parse_tool_call(MALFORMED_PAYLOAD), core._MALFORMED)
+    def test_captured_malformed_payload_repairs_in_place(self) -> None:
+        parsed = core._parse_tool_call(MALFORMED_PAYLOAD)
+        self.assertNotEqual(parsed, core._MALFORMED)
+        self.assertIsNotNone(parsed)
+        thinking, name, args = parsed
+        self.assertEqual(name, "restricted_exec")
+        self.assertEqual(len(args), 8)
+        self.assertEqual(args["command1"]["file"], "/codebase/src/homework_print_prep/orient.py")
+        self.assertEqual(args["command1"]["start"], 350)
+        self.assertEqual(args["command1"]["end"], 450)
+        self.assertEqual(args["command4"]["pattern"], "line.*score")
+
+    def test_truncated_payload_is_flagged_malformed(self) -> None:
+        self.assertEqual(core._parse_tool_call(UNRECOVERABLE_PAYLOAD), core._MALFORMED)
 
     def test_parse_response_reports_malformed_flag(self) -> None:
-        text, tool_info, malformed = core._parse_response(_frame(MALFORMED_PAYLOAD))
+        text, tool_info, malformed = core._parse_response(_frame(UNRECOVERABLE_PAYLOAD))
         self.assertIsNone(tool_info)
         self.assertTrue(malformed)
         self.assertIn("[TOOL_CALLS]", text)
@@ -105,7 +123,7 @@ class MalformedFeedbackLoopTest(unittest.TestCase):
         )
 
     def test_malformed_turn_is_retried_then_answer_parsed(self) -> None:
-        responses = [_frame(MALFORMED_PAYLOAD), _frame(ANSWER_PAYLOAD)]
+        responses = [_frame(UNRECOVERABLE_PAYLOAD), _frame(ANSWER_PAYLOAD)]
         with patch("core._streaming_request", side_effect=responses) as mock_req:
             result = self._search_once()
         self.assertEqual(mock_req.call_count, 2)
@@ -119,7 +137,7 @@ class MalformedFeedbackLoopTest(unittest.TestCase):
             captured.append(list(messages))
             return real_build(api_key, jwt, messages, tool_defs, model)
 
-        responses = [_frame(MALFORMED_PAYLOAD), _frame(ANSWER_PAYLOAD)]
+        responses = [_frame(UNRECOVERABLE_PAYLOAD), _frame(ANSWER_PAYLOAD)]
         with patch("core._build_request", side_effect=spy), \
              patch("core._streaming_request", side_effect=responses):
             self._search_once()
@@ -131,7 +149,7 @@ class MalformedFeedbackLoopTest(unittest.TestCase):
         self.assertIn("[TOOL_CALLS]", second[-2]["content"])
 
     def test_persistent_malformed_output_ends_search_with_meta(self) -> None:
-        responses = [_frame(MALFORMED_PAYLOAD)] * 5
+        responses = [_frame(UNRECOVERABLE_PAYLOAD)] * 5
         with patch("core._streaming_request", side_effect=responses) as mock_req:
             result = self._search_once(max_turns=4)
         self.assertEqual(result["files"], [])

@@ -330,6 +330,10 @@ def _valid_str(value: Any) -> bool:
     return isinstance(value, str) and bool(value)
 
 
+def _valid_int_or_none(value: Any) -> bool:
+    return value is None or (isinstance(value, int) and not isinstance(value, bool))
+
+
 class ToolExecutor:
     """在本地项目目录执行 SWE-grep 的受限工具命令。"""
     def __init__(self, project_root: str) -> None:
@@ -596,6 +600,9 @@ class ToolExecutor:
         if t == "readfile":
             if not _valid_str(cmd.get("file")):
                 return "Error: missing or invalid file path"
+            if not _valid_int_or_none(cmd.get("start_line")) or \
+                    not _valid_int_or_none(cmd.get("end_line")):
+                return "Error: missing or invalid line range"
             return self.readfile(cmd["file"], cmd.get("start_line"), cmd.get("end_line"))
         if t == "tree":
             if not _valid_str(cmd.get("path")):

@@ -175,6 +175,27 @@ class ExecutorGuardTest(unittest.TestCase):
             "Error: missing or invalid pattern",
         )
 
+    def test_wrong_typed_line_range_rejected(self) -> None:
+        (Path(self.temp_dir.name) / "a.py").write_text(
+            "def target():\n    pass\n", encoding="utf-8"
+        )
+        self.assertEqual(
+            self.executor.exec_command(
+                {"type": "readfile", "file": "a.py", "start_line": "350"}
+            ),
+            "Error: missing or invalid line range",
+        )
+        out = self.executor.exec_tool_call_async(
+            {"command1": {"type": "readfile", "file": "a.py", "end_line": "450"}}
+        )
+        self.assertIn("missing or invalid line range", out)
+        self.assertIn(
+            "1:",
+            self.executor.exec_command(
+                {"type": "readfile", "file": "a.py", "start_line": 1, "end_line": 2}
+            ),
+        )
+
     def test_non_dict_command_gets_error_result(self) -> None:
         out_async = self.executor.exec_tool_call_async({"command1": "junk"})
         self.assertIn("missing or invalid command", out_async)

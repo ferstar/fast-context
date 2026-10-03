@@ -24,8 +24,8 @@ describe("malformed restricted_exec response repair", () => {
     assert.deepEqual(parsed, {
       type: "readfile",
       file: "/codebase/src/a.mjs",
-      start: 4,
-      end: 9,
+      start_line: 4,
+      end_line: 9,
     });
   });
 
@@ -43,8 +43,8 @@ describe("malformed restricted_exec response repair", () => {
     assert.equal(commands.length, 3);
     assert.equal(commands[0].type, "readfile");
     assert.equal(commands[0].file, "/codebase/src/orient.py");
-    assert.equal(commands[0].start, 350);
-    assert.equal(commands[0].end, 450);
+    assert.equal(commands[0].start_line, 350);
+    assert.equal(commands[0].end_line, 450);
     assert.equal(commands[2].pattern, "perspective");
   });
 

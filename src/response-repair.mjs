@@ -7,8 +7,12 @@ export function repairJsonText(text) {
     .replace(/([{,]\s*)([A-Za-z_$][\w$-]*)"\s*:/g, '$1"$2":')
     .replace(/([{,]\s*)([A-Za-z_$][\w$-]*)\s*:/g, '$1"$2":')
     // `"start": 350` sometimes degrades to `"start_350` (the `": ` separator
-    // collapses into the underscore); only fires when no value follows.
-    .replace(/([{,]\s*)"([A-Za-z_$][\w$-]*)_(-?\d+)(?=\s*[,}])/g, '$1"$2": $3')
+    // collapses into the underscore); only fires when no value follows. The
+    // executor consumes start_line/end_line, so remap the model's aliases.
+    .replace(/([{,]\s*)"([A-Za-z_$][\w$-]*)_(-?\d+)(?=\s*[,}])/g, (_match, prefix, key, value) => {
+      const field = key === "start" ? "start_line" : key === "end" ? "end_line" : key;
+      return `${prefix}"${field}": ${value}`;
+    })
     .replace(/,\s*([}\]])/g, "$1");
 }
 

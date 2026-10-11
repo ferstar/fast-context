@@ -34,7 +34,8 @@ uv run --project "$SKILL_DIR" fast-context search \
   --project "<repo-root>"
 ```
 
-3. If you need faster warm-cache chunk retrieval in the same repo, run:
+3. Prefer hybrid `search` when accuracy matters. Most of that time is the remote Windsurf call, so a warm Semble cache does not make hybrid fast.
+4. Use `local-search` when a fast local candidate list is enough and you will verify the hits:
 
 ```bash
 uv run --project "$SKILL_DIR" fast-context local-search \
@@ -42,7 +43,7 @@ uv run --project "$SKILL_DIR" fast-context local-search \
   --project "<repo-root>"
 ```
 
-4. If a local chunk looks promising and you want related code, run:
+5. If a local chunk looks promising and you want related code, run:
 
 ```bash
 uv run --project "$SKILL_DIR" fast-context find-related \
@@ -51,9 +52,10 @@ uv run --project "$SKILL_DIR" fast-context find-related \
   --project "<repo-root>"
 ```
 
-5. Read the returned files before concluding anything.
-6. Use `rg` or `ast-grep` to confirm exact symbols, routes, tests, or call sites.
-7. Answer with concrete file paths, line ranges, and any uncertainty.
+6. Read the returned files before concluding anything.
+7. For "what decides whether X applies", read the `Callers / guard sites (low confidence, lexical):` section, or run `find-related` and then open the guard definition.
+8. Confirm symbols with `rg` or `ast-grep`. Pass an explicit path to `rg` (`rg -n pattern path`). With no path, a non-interactive shell makes `rg` read stdin and wait.
+9. Answer with concrete file paths, line ranges, and any uncertainty.
 
 ## Tuning
 
@@ -66,6 +68,10 @@ uv run --project "$SKILL_DIR" fast-context find-related \
 - Raise `--max-turns` only when the first pass is clearly incomplete.
 - Keep `--max-results` small unless the user asked for broader exploration.
 - Use `--content docs`, `--content config`, or `--content all` for local Semble searches beyond code.
+- `--no-decision-layer` or `FAST_CONTEXT_DECISION_LAYER=0` skips the lexical caller/guard section on `search` and `local-search`.
+- `FAST_CONTEXT_JWT_CACHE=0` skips the on-disk user JWT cache. The file is `jwt-<sha256(api_key)[:16]>.json` under `$XDG_CACHE_HOME/fast-context` or `~/.cache/fast-context`, mode `0600`. A token is reused while `exp - 60s` is still in the future. A payload with no `exp` is stored as fetched-at plus 10 minutes. HTTP 401, HTTP 403, or `unauthenticated` drops the cache and refetches once. The token is never logged.
+- A successful rate-limit pre-check is reused for about 30 seconds. A 429 is not cached.
+- On code queries, local ranking keeps but lowers `*.sql`, `deploy/`, `migrations/`, `.env*`, `*.example`, lockfiles, `*.min.js`, `generated/`, `dist/`, `build/`, and `*.snap`. A query that names sql, migration, env, deploy, or lock keeps those scores. When the query or the top hits point at one `apps/<name>/`, `packages/<name>/`, or `services/<name>/` root, other app roots rank lower, and the same basename stays higher in the preferred app.
 - If Semble cache grows after repo moves or temp-project searches, run `cache-gc`; use `cache-clear --project <repo-root>` to reset one project.
 
 Example:
@@ -109,8 +115,9 @@ uv run --project "$SKILL_DIR" fast-context cache-clear --project "<repo-root>"
 - Hybrid output can include both remote `Start here` files and local Semble chunk candidates. Treat local chunks as hints unless exact reads confirm them.
 - Local-only Semble results are chunk-level. Use them as precise starting snippets, then open the file when broader context is needed.
 - A `Salvaged from malformed remote response (low confidence)` section lists file hits recovered textually from a corrupted remote reply. Weaker than `Start here` — verify with a read before acting on them.
+- A `Callers / guard sites (low confidence, lexical):` section lists caller `file:line` and the guard definition `file:line`, at most about six entries. Treat it as a lexical hint. Follow-up search terms may include those guard names.
 - Follow-up search terms are model-generated hypotheses: deduplicate them, drop the ones you already know, and expect an occasional wrong or sibling-level hit. The ranked candidate files and their line ranges are the reliable part of the output and the better input to `rg`.
-- Add `--verbose` only when you need anchor snippets or config diagnostics.
+- Add `--verbose` when you need anchor snippets, config diagnostics, or the `[timing]` breakdown (repo map, anchors, local prefetch, rerank, JWT, rate limit, remote, decision layer).
 - Treat the output as candidate context, not proof. Verification still matters.
 
 ## Files
@@ -119,4 +126,6 @@ uv run --project "$SKILL_DIR" fast-context cache-clear --project "<repo-root>"
 - `src/core.py`: protocol, auth, repo-map logic, local lexical anchors
 - `src/local_repo_map.py`: BM25F directory heat, adaptive topK, hotspot subtrees, path spines
 - `src/local_semble.py`: local Semble search adapter
+- `src/decision_layer.py`: lexical caller and guard expansion
+- `src/local_rank.py`: local noise demotion and sibling-app ranking
 - `src/extract_key.py`: Windsurf credential extraction

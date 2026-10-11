@@ -68,7 +68,9 @@ fast-context/
 │       └── retrieval_benchmark_speed_vs_quality.svg
 ├── src/
 │   ├── core.py               # 协议、搜索循环、repo map、本地 lexical anchors
+│   ├── decision_layer.py     # 词法 caller / guard 扩展
 │   ├── extract_key.py        # 从 state.vscdb 提取 Windsurf 凭据
+│   ├── local_rank.py         # 本地噪声降权与同级 app 排序
 │   ├── local_repo_map.py     # BM25F 目录热度、adaptive topK、path spines
 │   ├── local_semble.py       # 本地 Semble 适配层
 │   └── fast_context_cli.py   # CLI 入口
@@ -120,7 +122,10 @@ python "$HOME/.agents/skills/fast-context/src/fast_context_cli.py" search \
 Notes:
 - Prefer `fast-context` before `rg` for vague questions: debugging explorations, "where is X?", flow tracing, or feature-oriented repo navigation.
 - If the exact filename, path, or symbol is already known, use `rg` or open the file directly instead of starting with `fast-context`.
+- Prefer hybrid `search` when accuracy matters. Use `local-search` when a fast local candidate list is enough and you will verify the hits. Hybrid time is dominated by the remote Windsurf call, so a warm Semble cache does not make hybrid fast.
 - Treat `fast-context` as a candidate-file generator, not a proof source. After it returns results, read the relevant files and use exact search only to confirm names, events, tests, or call sites.
+- For "what decides whether X applies", read the `Callers / guard sites (low confidence, lexical):` section or run `find-related`, then open the guard definition.
+- Pass an explicit path to `rg` (`rg -n pattern <repo-root>`). With no path, a non-interactive shell makes `rg` read stdin and wait.
 - Split unrelated questions into separate `fast-context` queries. Long natural-language queries are fine when they describe one workflow, but multi-topic queries can drop weaker subtopics.
 - Do not treat "results found" as evidence that a feature exists. For negative or fictional queries, `fast-context` may still return approximate matches; verify existence from the code before concluding.
 - Prefer queries that describe behavior and data flow, not just nouns: include user action, runtime boundary, expected effect, and any known payload fields.
@@ -144,7 +149,8 @@ uv run fast-context search \
 - `--max-turns <1-5>`
 - `--max-results <1-30>`
 - `--timeout-ms <ms>`
-- `--verbose`
+- `--verbose`（包含 `[timing]` 分段耗时）
+- `--no-decision-layer`，用于 `search` 和 `local-search`（也可用 `FAST_CONTEXT_DECISION_LAYER=0`）
 - `--exclude <path-or-glob>`，可重复传入
 - `--content code|docs|config|all`，用于 Semble 预取和 local-only 搜索
 
@@ -164,9 +170,17 @@ Start here:
 
 Follow-up search terms:
 applyExternalSession, createAuthHandoff, handoff.*state
+
+Callers / guard sites (low confidence, lexical):
+
+- /repo/apps/desktop/src/auth/ipc.ts:40 calls applyExternalSession; guard requireTrustedHandoff defined at /repo/apps/desktop/src/auth/policy.ts:12
 ```
 
-`--backend hybrid` 先跑 Semble，把本地 top chunks 塞进 Windsurf 的搜索 prompt，然后让 Windsurf 用受限的 repo 工具验证和扩展。如果远端走不通——比如鉴权失败、超时、上游 `resource_exhausted`——CLI 还是会返回本地 Semble 结果，agent 至少能继续往下走。
+`--backend hybrid` 先跑 Semble，把本地 top chunks 塞进 Windsurf 的搜索 prompt，然后让 Windsurf 用受限的 repo 工具验证和扩展。如果远端走不通——比如鉴权失败、超时、上游 `resource_exhausted`——CLI 还是会返回本地 Semble 结果，agent 至少能继续往下走。准确率优先时用 hybrid `search`。这段时间主要花在远端 Windsurf 调用上，Semble 热缓存不会把 hybrid 变快。只要一份本地候选名单时，用 `local-search`。
+
+`search` 和 `local-search` 会在顶部结果文件之后附加 `Callers / guard sites (low confidence, lexical):`。它列出调用点 `file:line`，以及能解析到的 guard 定义 `file:line`（大约最多 6 条）。这些 guard 名字也会追加进 follow-up search terms。问「什么条件决定 X 是否生效」时，读这一段，或先跑 `find-related` 再打开 guard 的定义。`--no-decision-layer` 和 `FAST_CONTEXT_DECISION_LAYER=0` 会跳过它。
+
+代码查询会降权（保留，但分数更低）这些非源码噪声：`*.sql`、`deploy/`、`migrations/`、`.env*`、`*.example`、lockfile、`*.min.js`、`generated/`、`dist/`、`build/`、`*.snap`。查询里点名 sql、migration、env、deploy 或 lock 时保留原分。`apps/<name>/`、`packages/<name>/`、`services/<name>/` 下的同级应用里，查询文本、顶部命中或 hybrid anchors 指向的那个 app 排得更高；同名文件也留在这个 app 里更靠前。本地检索会先多取大约 2 倍 `--max-results`，重排后再截断。
 
 ### 本地 Semble 搜索
 
@@ -248,6 +262,9 @@ uv run fast-context extract-key --db-path ~/.local/share/devin/credentials.toml
 - `WS_REMOTE_LOCK_POLL_MS`：锁重试间隔，默认 `100`
 - `WS_APP_VER`
 - `WS_LS_VER`
+- `FAST_CONTEXT_DECISION_LAYER`：设为 `0`（或 `false`、`no`、`off`）时跳过词法 caller/guard 扩展
+- `FAST_CONTEXT_JWT_CACHE`：设为 `0` 时不用磁盘上的用户 JWT 缓存。否则文件是 `$XDG_CACHE_HOME/fast-context/jwt-<sha256(api_key)[:16]>.json`；未设置 `XDG_CACHE_HOME` 时落在 `~/.cache/fast-context/...`。创建权限是 `0600`，内容是 token 和 `exp`。`exp` 从 JWT payload 读取，不校验签名。payload 没有 `exp` 时，按获取时间加 10 分钟写入。仅当 `exp - 60s` 仍晚于当前时间才复用。HTTP 401、HTTP 403 或 `unauthenticated` 会删掉缓存并重新获取一次。token 不会写入日志。
+- 成功的 `CheckUserMessageRateLimit` 预检大约复用 30 秒，同时写在内存和同一缓存目录的 `rate-ok-<hash>.json`。429 不会被缓存。
 
 ## 模型选择
 
@@ -380,18 +397,17 @@ uv run python -m benchmarks.run_repo_map_ab \
 ### 评测结论与选型建议
  
 - **`local` 模式具备极高的性价比基线**：热缓存下 p50 延迟仅 `30 ms`，即可达到 `0.854` NDCG@10 与 `0.946` Recall@10，全程 0 失败。非常适合 CI 流水线、批量自动化评测以及对延迟敏感的高频交互。
-- **`hybrid` 是交互场景下的首选**：本地 Semble 预取为远端模型提供了高相关性的上下文锚点，最终召回与精度（NDCG@10 0.890 / Recall@10 0.979）均优于纯远端或纯本地。同时内建降级机制确保即使远端超限，也不会阻断 Agent 的工作流。
+- **`hybrid` 是交互场景下的首选**：本地 Semble 预取为远端模型提供了高相关性的上下文锚点，最终召回与精度（NDCG@10 0.890 / Recall@10 0.979）均优于纯远端或纯本地。同时内建降级机制确保即使远端超限，也不会阻断 Agent 的工作流。在一个大型私有 monorepo 上，hybrid 中位数大约 7.8 秒；Semble 热缓存没有缩短它，因为时间主要在远端 Windsurf 调用。
 - **`remote` 适合作为消融对照**：用于单独排查 Windsurf 在无本地分块提示时的独立表现。
  
 ## 使用建议
  
 建议直接通过 `SKILL.md` 配置给 Coding Agent，也可以在终端直接使用 CLI 调试：
  
-1. **优先使用默认模式**：输入自然语言，以 `--backend hybrid` 启动检索。
-2. **查阅候选清单**：重点阅读返回的文件路径与代码行区间。
-3. **低延迟与离线环境**：使用 `--backend local` 获得毫秒级本地检索，无外部网络与账户依赖。
-4. **追查关联实现**：对命中关键位置的代码，使用 `find-related` 进一步挖掘相关逻辑。
-5. **精确定位**：拿到候选文件后，再通过 `rg` 或 `ast-grep` 锁定精确调用点和修改位置。
+1. **准确率优先时用 hybrid `search`**：用默认 `--backend hybrid` 提交自然语言查询。这段时间主要在远端 Windsurf 调用，Semble 热缓存不会把 hybrid 变快。
+2. **只要快速候选名单时用 `local-search`**：`--backend local` 只返回 Semble chunks，不依赖远端账户。先读命中内容，再把它当成答案。
+3. **「什么条件决定 X 是否生效」要往上追一层**：读 `Callers / guard sites (low confidence, lexical):`，或先跑 `find-related` 再打开 guard 的定义。
+4. **再用精确搜索确认**：对候选文件使用 `rg` 或 `ast-grep`。`rg` 必须带明确路径。不带路径时，非交互 shell 里 `rg` 会读 stdin 并一直等待。
  
 ## 数据与隐私说明
 
@@ -407,6 +423,8 @@ uv run python -m benchmarks.run_repo_map_ab \
 ## 补充说明
  
 - **词法锚点（Lexical Anchors）**：结合精确文件名、路径片段与查询中的字面量特征，自动提取启发式定位线索。
+- **决策层（Decision layer）**：`search` 和 `local-search` 之后，会在顶部文件里抽出符号，做有界的词法 caller / guard 查找。失败时静默跳过。`--verbose` 的 `[timing]` 里包含这一步。
+- **本地排序（Local ranking）**：代码查询会在多取一些候选之后降权非源码噪声和同级 app 的重复文件，再截断到 `--max-results`。
 - **动态预算裁剪**：Repo Map 优先保证顶层树与具体命中的文件路径；若超出 Token 预算，会按优先级缩减热点子树或退回紧凑树。
 - **Semble 缓存生命周期**：索引直接接入 Semble 缓存系统，当文件未变动时秒级复用，代码变更时自动触发增量失效。
 - **结果验证原则**：检索结果（包括本地分块与远端提示）旨在缩小排查范围，Agent 在得出结论或执行修改前，应始终先读取对应源码核验。
@@ -414,3 +432,7 @@ uv run python -m benchmarks.run_repo_map_ab \
 ## License
 
 MIT
+
+## 私有 monorepo A/B (2026-10-12)
+
+在一个私有 TypeScript monorepo (约 4.4k 文件, 5 个已知答案的问题) 上: hybrid 准确率保持 top3 5/5, hybrid 中位延迟 7.3 s 降到 6.7 s, `local-search` top3 从 4/5 提升到 5/5, 跨模块问题 "由什么决定是否生效" 的守卫函数在 2/2 次运行中被找到 (之前 0/2)。详见 [benchmarks/results/private-monorepo-ab-2026-10-12.md](benchmarks/results/private-monorepo-ab-2026-10-12.md)。

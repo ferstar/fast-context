@@ -69,7 +69,7 @@ class LocalSembleOutputTest(unittest.TestCase):
         self.assertIn("score=0.1235", result)
         self.assertIn("snippet: def search(query: str):", result)
         mock_search.assert_called_once()
-        self.assertEqual(mock_search.call_args.kwargs["top_k"], 3)
+        self.assertEqual(mock_search.call_args.kwargs["top_k"], 6)
 
     @patch("core.semble_search")
     @patch("core.search")

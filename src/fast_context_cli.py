@@ -31,6 +31,17 @@ def _add_local_content_args(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def _add_decision_layer_arg(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--no-decision-layer",
+        action="store_true",
+        help=(
+            "Skip lexical caller and guard expansion. "
+            "FAST_CONTEXT_DECISION_LAYER=0 disables it too."
+        ),
+    )
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="fast-context",
@@ -58,8 +69,9 @@ def _build_parser() -> argparse.ArgumentParser:
     search_parser.add_argument(
         "--verbose",
         action="store_true",
-        help="Show anchor snippets and diagnostic config in successful output.",
+        help="Show anchor snippets, timing, and diagnostic config in successful output.",
     )
+    _add_decision_layer_arg(search_parser)
     search_parser.add_argument(
         "--exclude",
         action="append",
@@ -72,6 +84,7 @@ def _build_parser() -> argparse.ArgumentParser:
     local_parser.add_argument("--project", default=".", help="Project root directory")
     local_parser.add_argument("--max-results", type=int, default=10, help="Max chunks to return")
     local_parser.add_argument("--verbose", action="store_true", help="Show local backend diagnostics.")
+    _add_decision_layer_arg(local_parser)
     _add_local_content_args(local_parser)
 
     related_parser = subparsers.add_parser("find-related", help="Find local chunks related to a file and line")
@@ -114,6 +127,7 @@ def run_search(args: argparse.Namespace) -> int:
         verbose=args.verbose,
         backend=args.backend,
         content_types=args.content,
+        decision_layer=not args.no_decision_layer,
     )
     print(result)
     return 0
@@ -127,6 +141,7 @@ def run_local_search(args: argparse.Namespace) -> int:
         max_results=args.max_results,
         content_types=args.content,
         verbose=args.verbose,
+        decision_layer=not args.no_decision_layer,
     )
     print(result)
     return 0

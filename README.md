@@ -68,7 +68,9 @@ fast-context/
 │       └── retrieval_benchmark_speed_vs_quality.svg
 ├── src/
 │   ├── core.py               # Protocol, search loop, repo map, local lexical anchors
+│   ├── decision_layer.py     # Lexical caller and guard expansion
 │   ├── extract_key.py        # Windsurf credential extraction from state.vscdb
+│   ├── local_rank.py         # Local noise demotion and sibling-app ranking
 │   ├── local_repo_map.py     # BM25F directory heat, adaptive topK, path spines
 │   ├── local_semble.py       # Local Semble adapter
 │   └── fast_context_cli.py   # CLI entrypoint for the skill
@@ -120,7 +122,10 @@ python "$HOME/.agents/skills/fast-context/src/fast_context_cli.py" search \
 Notes:
 - Prefer `fast-context` before `rg` for vague questions: debugging explorations, "where is X?", flow tracing, or feature-oriented repo navigation.
 - If the exact filename, path, or symbol is already known, use `rg` or open the file directly instead of starting with `fast-context`.
+- Prefer hybrid `search` when accuracy matters. Use `local-search` when a fast local candidate list is enough and you will verify the hits. Hybrid time is dominated by the remote Windsurf call, so a warm Semble cache does not make hybrid fast.
 - Treat `fast-context` as a candidate-file generator, not a proof source. After it returns results, read the relevant files and use exact search only to confirm names, events, tests, or call sites.
+- For "what decides whether X applies", read the `Callers / guard sites (low confidence, lexical):` section or run `find-related`, then open the guard definition.
+- Pass an explicit path to `rg` (`rg -n pattern <repo-root>`). With no path, a non-interactive shell makes `rg` read stdin and wait.
 - Split unrelated questions into separate `fast-context` queries. Long natural-language queries are fine when they describe one workflow, but multi-topic queries can drop weaker subtopics.
 - Do not treat "results found" as evidence that a feature exists. For negative or fictional queries, `fast-context` may still return approximate matches; verify existence from the code before concluding.
 - Prefer queries that describe behavior and data flow, not just nouns: include user action, runtime boundary, expected effect, and any known payload fields.
@@ -144,7 +149,8 @@ Useful options:
 - `--max-turns <1-5>`
 - `--max-results <1-30>`
 - `--timeout-ms <ms>`
-- `--verbose`
+- `--verbose` (includes a `[timing]` breakdown)
+- `--no-decision-layer` on `search` and `local-search` (also `FAST_CONTEXT_DECISION_LAYER=0`)
 - `--exclude <path-or-glob>` repeatable
 - `--content code|docs|config|all` for Semble prefetch and local-only search
 
@@ -164,9 +170,17 @@ Start here:
 
 Follow-up search terms:
 applyExternalSession, createAuthHandoff, handoff.*state
+
+Callers / guard sites (low confidence, lexical):
+
+- /repo/apps/desktop/src/auth/ipc.ts:40 calls applyExternalSession; guard requireTrustedHandoff defined at /repo/apps/desktop/src/auth/policy.ts:12
 ```
 
-`--backend hybrid` runs Semble first, injects the top local chunks into the Windsurf search prompt, then asks Windsurf to verify and expand with restricted repo tools. If the remote path fails, including auth errors, timeouts, and upstream `resource_exhausted`, the CLI still returns the local Semble chunks so the agent can keep moving.
+`--backend hybrid` runs Semble first, injects the top local chunks into the Windsurf search prompt, then asks Windsurf to verify and expand with restricted repo tools. If the remote path fails, including auth errors, timeouts, and upstream `resource_exhausted`, the CLI still returns the local Semble chunks so the agent can keep moving. Hybrid `search` is the accuracy path. Most of its time is the remote Windsurf call, so a warm Semble cache does not make hybrid fast. `local-search` is the fast Semble path when a local candidate list is enough.
+
+`search` and `local-search` append `Callers / guard sites (low confidence, lexical):` for the top result files. It lists caller `file:line` and, when resolved, the guard definition `file:line` (at most about six entries). Guard names are also appended to the follow-up search terms. For "what decides whether X applies", read that section or run `find-related`, then open the guard definition. `--no-decision-layer` and `FAST_CONTEXT_DECISION_LAYER=0` skip it.
+
+Code queries demote (keep, with a lower score) `*.sql`, paths under `deploy/` or `migrations/`, `.env*`, `*.example`, lockfiles, `*.min.js`, `generated/`, `dist/`, `build/`, and `*.snap`. A query that names sql, migration, env, deploy, or lock keeps those scores. Sibling roots under `apps/<name>/`, `packages/<name>/`, or `services/<name>/` prefer the app named by the query or by the majority of the top hits (or hybrid anchors). The same basename stays higher in that preferred app. Local search fetches about twice `--max-results` before this rerank.
 
 ### Local Semble search
 
@@ -248,6 +262,9 @@ When no source is usable the error lists the paths that were searched. Credentia
 - `WS_REMOTE_LOCK_POLL_MS`: lock retry interval. Default is `100`
 - `WS_APP_VER`
 - `WS_LS_VER`
+- `FAST_CONTEXT_DECISION_LAYER`: set to `0` (also `false`, `no`, or `off`) to skip lexical caller/guard expansion
+- `FAST_CONTEXT_JWT_CACHE`: set to `0` to skip the on-disk user JWT cache. Otherwise the file is `$XDG_CACHE_HOME/fast-context/jwt-<sha256(api_key)[:16]>.json`, or `~/.cache/fast-context/...` when `XDG_CACHE_HOME` is unset. It is created mode `0600` and stores the token plus `exp`. The payload `exp` is read without signature verification. A token with no `exp` is stored as fetched-at plus 10 minutes. It is reused only while `exp - 60s` is still in the future. HTTP 401, HTTP 403, or `unauthenticated` drops the file and refetches once. The token is never logged.
+- A successful `CheckUserMessageRateLimit` pre-check is reused for about 30 seconds, in memory and in `rate-ok-<hash>.json` under the same cache directory. A 429 is not cached.
 
 ## Model choice
 
@@ -381,18 +398,17 @@ Local warm-cache index build time (measured prior to query evaluation):
 ### Key Takeaways
 
 - **`local` is a reliable, high-throughput baseline**: With a warm p50 of `30 ms` and strong retrieval metrics (`0.854` NDCG@10 / `0.946` Recall@10 with zero failures), it is ideal for CI, bulk evals, and latency-critical offline pipelines.
-- **`hybrid` is the recommended interactive default**: Combining Semble prefetch hints with Windsurf verification achieves top retrieval quality (`0.890` NDCG@10 / `0.979` Recall@10) while ensuring the agent never stalls due to remote limits.
+- **`hybrid` is the recommended interactive default**: Combining Semble prefetch hints with Windsurf verification achieves top retrieval quality (`0.890` NDCG@10 / `0.979` Recall@10) while ensuring the agent never stalls due to remote limits. On a large private monorepo the hybrid median was about 7.8s, and a warm Semble cache did not shorten it, because the remote Windsurf call dominates.
 - **`remote` serves as an ablation baseline**: Useful for isolating raw Windsurf reasoning performance without prior local chunk hints.
 
 ## Recommended Workflow
 
 Fast Context works best when configured as an agent skill via `SKILL.md`, but the CLI is equally suited for direct interactive exploration:
 
-1. **Start with Hybrid Search**: Submit natural-language queries using default `--backend hybrid`.
-2. **Inspect Candidate Files**: Focus on the returned candidate files and suggested line ranges.
-3. **Offline or Low-Latency Needs**: Switch to `--backend local` for instant, dependency-free chunk retrieval.
-4. **Follow Call Chains**: For promising code locations, run `find-related` to discover adjacent logic.
-5. **Pinpoint Changes**: Transition to exact-match tools (`rg` or `ast-grep`) once candidates are identified.
+1. **Prefer hybrid `search` when accuracy matters**: Submit natural-language queries with the default `--backend hybrid`. Most of that time is the remote Windsurf call, so a warm Semble cache does not make hybrid fast.
+2. **Use `local-search` for a fast candidate list**: `--backend local` returns Semble chunks with no remote account. Read the hits before you treat them as the answer.
+3. **Trace one layer up for "what decides whether X applies"**: Read `Callers / guard sites (low confidence, lexical):`, or run `find-related` and then open the guard definition.
+4. **Confirm with exact search**: Use `rg` or `ast-grep` on the candidate files. Pass an explicit path to `rg`. With no path, a non-interactive shell makes `rg` read stdin and wait.
 
 ## Data & Privacy
 
@@ -408,6 +424,8 @@ Fast Context works best when configured as an agent skill via `SKILL.md`, but th
 ## Implementation Details
 
 - **Lexical Anchors**: Heuristically extracts exact filenames, path segments, and verbatim literals from the user query.
+- **Decision layer**: After `search` and `local-search`, a bounded lexical pass looks for callers of symbols defined in the top files and for conditional guards around those calls. Failures are skipped. `--verbose` includes this step in `[timing]`.
+- **Local ranking**: Code queries demote non-source noise and sibling-app duplicates after fetching extra candidates, then truncate to `--max-results`.
 - **Dynamic Tree Pruning**: Repo maps prioritize top-level trees and exact lexical hits. When token budgets shrink, hotspot subtrees compress dynamically before falling back to classic compact trees.
 - **Cache Invalidation**: Leverages Semble's native cache tracking, invalidating indexes incrementally only when files change.
 - **Verification Rule**: Search results are candidate pointers rather than definitive proofs; agents should inspect targeted source files before committing edits.
@@ -415,3 +433,7 @@ Fast Context works best when configured as an agent skill via `SKILL.md`, but th
 ## License
 
 MIT
+
+## Private monorepo A/B (2026-10-12)
+
+On a private TypeScript monorepo (about 4.4k files, 5 known-answer questions), this release kept hybrid accuracy at 5/5 top3, cut median hybrid latency from 7.3 s to 6.7 s, raised `local-search` top3 from 4/5 to 5/5, and surfaced the cross-module guard for the "what decides whether it applies" question in 2/2 runs (was 0/2). Details: [benchmarks/results/private-monorepo-ab-2026-10-12.md](benchmarks/results/private-monorepo-ab-2026-10-12.md).

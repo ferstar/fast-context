@@ -13,6 +13,7 @@ Flow:
 
 from __future__ import annotations
 
+import base64
 import gzip
 import hashlib
 import json
@@ -36,6 +37,8 @@ from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
+from decision_layer import DecisionLayerReport, build_decision_layer, decision_layer_enabled
+from local_rank import rerank_local_results
 from local_repo_map import build_classic_repo_map, build_optimized_repo_map
 from local_semble import SembleUnavailable, find_related as semble_find_related, search as semble_search
 from response_repair import (
@@ -1467,7 +1470,103 @@ def _streaming_request(
     raise _classify_error(last_error or RuntimeError("unknown streaming error"))
 
 
-def fetch_jwt(api_key: str) -> str:
+def _user_cache_dir() -> Path:
+    xdg = os.environ.get("XDG_CACHE_HOME", "").strip()
+    if xdg:
+        return Path(xdg).expanduser()
+    return Path.home() / ".cache"
+
+
+def _fast_context_cache_dir() -> Path:
+    return _user_cache_dir() / "fast-context"
+
+
+def _jwt_cache_enabled() -> bool:
+    raw = os.environ.get("FAST_CONTEXT_JWT_CACHE", "").strip().lower()
+    return raw not in {"0", "false", "no", "off"}
+
+
+def _jwt_cache_path(api_key: str) -> Path:
+    digest = hashlib.sha256(api_key.encode("utf-8")).hexdigest()[:16]
+    return _fast_context_cache_dir() / f"jwt-{digest}.json"
+
+
+def _decode_jwt_exp(token: str) -> int | None:
+    """Read the ``exp`` claim. Signature is not verified; this is only a TTL hint."""
+    try:
+        parts = token.split(".")
+        if len(parts) < 2 or not parts[1]:
+            return None
+        payload = parts[1]
+        pad = "=" * (-len(payload) % 4)
+        data = json.loads(base64.urlsafe_b64decode(payload + pad))
+    except Exception:
+        return None
+    if not isinstance(data, dict):
+        return None
+    exp = data.get("exp")
+    if isinstance(exp, bool) or not isinstance(exp, (int, float)):
+        return None
+    return int(exp)
+
+
+def _jwt_expiry(token: str, *, fetched_at: float) -> int:
+    decoded = _decode_jwt_exp(token)
+    if decoded is None:
+        return int(fetched_at + 600)
+    return decoded
+
+
+def _load_cached_jwt(api_key: str, now: float | None = None) -> str | None:
+    if not _jwt_cache_enabled():
+        return None
+    current = time.time() if now is None else now
+    try:
+        payload = json.loads(_jwt_cache_path(api_key).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, UnicodeError, ValueError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    token = payload.get("token")
+    exp = payload.get("exp")
+    if not isinstance(token, str) or not token:
+        return None
+    if isinstance(exp, bool) or not isinstance(exp, (int, float)):
+        return None
+    if float(exp) - 60 > current:
+        return token
+    return None
+
+
+def _store_cached_jwt(api_key: str, token: str, now: float | None = None) -> None:
+    if not _jwt_cache_enabled() or not token:
+        return
+    try:
+        path = _jwt_cache_path(api_key)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fetched_at = time.time() if now is None else now
+        body = json.dumps(
+            {"token": token, "exp": _jwt_expiry(token, fetched_at=fetched_at)},
+            separators=(",", ":"),
+        ).encode("utf-8")
+        fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        try:
+            os.write(fd, body)
+        finally:
+            os.close(fd)
+        os.chmod(path, 0o600)
+    except Exception:
+        return
+
+
+def _invalidate_cached_jwt(api_key: str) -> None:
+    try:
+        _jwt_cache_path(api_key).unlink(missing_ok=True)
+    except OSError:
+        return
+
+
+def _request_user_jwt(api_key: str) -> str:
     meta = ProtobufEncoder()
     meta.write_string(1, WS_APP)
     meta.write_string(2, WS_APP_VER)
@@ -1479,25 +1578,135 @@ def fetch_jwt(api_key: str) -> str:
     outer = ProtobufEncoder()
     outer.write_message(1, meta)
     resp = _unary_request(f"{AUTH_BASE}/GetUserJwt", outer.to_bytes(), compress=False)
-    for s in proto_extract_strings(resp):
-        if s.startswith("eyJ") and "." in s:
-            return s
+    for item in proto_extract_strings(resp):
+        if item.startswith("eyJ") and "." in item:
+            return item
     raise RuntimeError("无法从 GetUserJwt 响应中提取 JWT")
 
 
+def fetch_jwt(api_key: str) -> str:
+    """Return a user JWT, reusing a disk cache entry that is still outside its skew window."""
+    cached = _load_cached_jwt(api_key)
+    if cached:
+        fetch_jwt.last_cache = "hit"
+        return cached
+    fetch_jwt.last_cache = "disabled" if not _jwt_cache_enabled() else "miss"
+    token = _request_user_jwt(api_key)
+    _store_cached_jwt(api_key, token)
+    return token
+
+
+fetch_jwt.last_cache = "miss"
+
+_RATE_LIMIT_OK_TTL_S = 30.0
+_RATE_LIMIT_OK_UNTIL: dict[str, float] = {}
+_AUTH_ERROR_CODES = {"auth_error", "unauthenticated", "unauthorized", "permission_denied"}
+
+
+def _rate_limit_cache_key(api_key: str, model: str) -> str:
+    return hashlib.sha256(f"{api_key}\0{model}".encode("utf-8")).hexdigest()[:16]
+
+
+def _rate_limit_disk_path(key: str) -> Path:
+    return _fast_context_cache_dir() / f"rate-ok-{key}.json"
+
+
+def _rate_limit_disk_fresh(key: str, now: float | None = None) -> bool:
+    current = time.time() if now is None else now
+    try:
+        payload = json.loads(_rate_limit_disk_path(key).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, UnicodeError, ValueError, TypeError):
+        return False
+    if not isinstance(payload, dict):
+        return False
+    exp = payload.get("exp")
+    return isinstance(exp, (int, float)) and not isinstance(exp, bool) and float(exp) > current
+
+
+def _remember_rate_limit_ok(key: str, monotonic_now: float) -> None:
+    _RATE_LIMIT_OK_UNTIL[key] = monotonic_now + _RATE_LIMIT_OK_TTL_S
+    try:
+        path = _rate_limit_disk_path(key)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        body = json.dumps({"exp": time.time() + _RATE_LIMIT_OK_TTL_S}).encode("utf-8")
+        fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        try:
+            os.write(fd, body)
+        finally:
+            os.close(fd)
+    except Exception:
+        return
+
+
+def _forget_rate_limit_ok(key: str) -> None:
+    _RATE_LIMIT_OK_UNTIL.pop(key, None)
+    try:
+        _rate_limit_disk_path(key).unlink(missing_ok=True)
+    except OSError:
+        return
+
+
 def check_rate_limit(api_key: str, jwt: str, model: str) -> bool:
+    """Pre-check Windsurf quota. A positive result is reused for a short TTL.
+
+    ``_unary_request`` wraps HTTP failures as ``FastContextError``, so a 429 is
+    reported as ``RATE_LIMITED`` rather than a raw ``HTTPError``. Network
+    failures still return True so a blip does not block the real request.
+    Positive results are cached; a 429 is not.
+    """
+    check_rate_limit.last_cached = False
+    key = _rate_limit_cache_key(api_key, model)
+    now_mono = time.monotonic()
+    cached_until = _RATE_LIMIT_OK_UNTIL.get(key, 0.0)
+    if cached_until > now_mono or _rate_limit_disk_fresh(key):
+        _RATE_LIMIT_OK_UNTIL[key] = now_mono + _RATE_LIMIT_OK_TTL_S
+        check_rate_limit.last_cached = True
+        return True
     req = ProtobufEncoder()
     req.write_message(1, _build_metadata(api_key, jwt))
     req.write_string(3, model)
     try:
         _unary_request(f"{API_BASE}/CheckUserMessageRateLimit", req.to_bytes(), compress=True)
-        return True
-    except HTTPError as e:
-        if e.code == 429:
+    except FastContextError as exc:
+        if exc.code == "RATE_LIMITED":
+            _forget_rate_limit_ok(key)
             return False
-        raise
+        return True
+    except HTTPError as exc:
+        if exc.code == 429:
+            _forget_rate_limit_ok(key)
+            return False
+        return True
     except Exception:
-        return True  # 网络问题时不阻塞
+        return True
+    _remember_rate_limit_ok(key, now_mono)
+    return True
+
+
+check_rate_limit.last_cached = False
+
+
+def _is_auth_error_result(result: dict[str, Any]) -> bool:
+    meta = result.get("_meta") or {}
+    code = str(meta.get("error_code") or "").strip().lower()
+    if code in _AUTH_ERROR_CODES:
+        return True
+    error = str(result.get("error") or "")
+    lowered = error.lower()
+    if "auth_error" in lowered or "unauthenticated" in lowered or "unauthorized" in lowered:
+        return True
+    return bool(re.search(r"\b(?:401|403)\b", error))
+
+
+def _merge_timing(result: dict[str, Any], updates: dict[str, float], jwt_cache: str | None = None) -> dict[str, Any]:
+    meta = result.setdefault("_meta", {})
+    timing = dict(meta.get("timing_ms") or {})
+    for key, value in updates.items():
+        timing[key] = round(float(value), 1)
+    meta["timing_ms"] = timing
+    if jwt_cache:
+        meta["jwt_cache"] = jwt_cache
+    return result
 
 
 # ─── 请求构建 ──────────────────────────────────────────────
@@ -1902,6 +2111,19 @@ def _search_remote_models(
     model_candidates = _resolve_model_candidates()
     retry_base_ms, retry_max_ms, max_model_retries = _resolve_retry_config()
     last_result: Dict[str, Any] | None = None
+    rate_limit_ms = 0.0
+    remote_ms = 0.0
+    rate_limit_cached_hits = 0
+
+    def finish(result: Dict[str, Any]) -> Dict[str, Any]:
+        meta = result.setdefault("_meta", {})
+        timing = dict(meta.get("timing_ms") or {})
+        timing["rate_limit"] = round(rate_limit_ms, 1)
+        timing["remote"] = round(remote_ms, 1)
+        meta["timing_ms"] = timing
+        if rate_limit_cached_hits:
+            meta["rate_limit_cached"] = rate_limit_cached_hits
+        return result
 
     for index, model in enumerate(model_candidates, 1):
         for retry_count in range(max_model_retries + 1):
@@ -1913,7 +2135,13 @@ def _search_remote_models(
             else:
                 log(f"检查模型 {model} ({index}/{len(model_candidates)})")
 
-            if not check_rate_limit(api_key, jwt, model):
+            rate_started = time.perf_counter()
+            allowed = check_rate_limit(api_key, jwt, model)
+            rate_limit_ms += (time.perf_counter() - rate_started) * 1000
+            if getattr(check_rate_limit, "last_cached", False) is True:
+                rate_limit_cached_hits += 1
+
+            if not allowed:
                 result = {
                     "files": [],
                     "error": "触发限流，请稍后再试",
@@ -1927,6 +2155,7 @@ def _search_remote_models(
                     },
                 }
             else:
+                remote_started = time.perf_counter()
                 result = _search_once(
                     query=query,
                     project_root=project_root,
@@ -1944,6 +2173,7 @@ def _search_remote_models(
                     repo_map_meta=repo_map_meta,
                     on_progress=on_progress,
                 )
+                remote_ms += (time.perf_counter() - remote_started) * 1000
 
             result = _attach_model_metadata(
                 result,
@@ -1959,7 +2189,7 @@ def _search_remote_models(
                 error_code = meta.get("error_code") or _extract_inline_error_code(result["error"])
 
             if not result.get("error"):
-                return result
+                return finish(result)
 
             if _should_retry_same_model(error_code) and retry_count < max_model_retries:
                 delay_ms = _sleep_with_backoff(retry_base_ms, retry_max_ms, retry_count + 1)
@@ -1974,9 +2204,9 @@ def _search_remote_models(
                 log(f"{model} 返回 {error_code}，切换到备用模型")
                 break
 
-            return result
+            return finish(result)
 
-    return last_result or {
+    return finish(last_result or {
         "files": [],
         "error": "没有可用的模型候选",
         "_meta": {
@@ -1986,7 +2216,7 @@ def _search_remote_models(
             "project_root": project_root,
             **repo_map_meta,
         },
-    }
+    })
 
 
 def search(
@@ -2036,12 +2266,15 @@ def search(
     tool_defs = get_tool_definitions(max_commands)
     system_prompt = build_system_prompt(max_turns, max_commands, max_results)
 
+    timing_ms: dict[str, float] = {}
+    map_started = time.perf_counter()
     repo_map, actual_depth, tree_size_bytes, fell_back, repo_map_meta = _get_repo_map_with_meta(
         project_root,
         query,
         tree_depth,
         exclude_paths,
     )
+    timing_ms["repo_map"] = (time.perf_counter() - map_started) * 1000
     hot_dirs = repo_map_meta.get("hot_dirs") or []
     log(
         f"Repo map: tree -L {actual_depth} "
@@ -2050,11 +2283,13 @@ def search(
         f" [strategy={repo_map_meta.get('repo_map_strategy')}]"
         f"{f' [hot={','.join(hot_dirs)}]' if hot_dirs else ''}"
     )
+    anchor_started = time.perf_counter()
     local_anchor_brief = build_local_anchor_brief(
         query,
         project_root,
         _effective_excludes(exclude_paths),
     )
+    timing_ms["lexical_anchors"] = (time.perf_counter() - anchor_started) * 1000
     user_content = "\n\n".join([
         f"Problem Statement: {query}",
         local_context or "",
@@ -2062,31 +2297,52 @@ def search(
         f"Repo Map (tree -L {actual_depth} /codebase):\n```text\n{repo_map}\n```",
     ]).strip()
 
+    supplied_jwt = jwt is not None
+    jwt_cache_state = "supplied" if supplied_jwt else None
+
+    def _run_remote(active_jwt: str) -> dict[str, Any]:
+        return _search_remote_models(
+            query=query,
+            project_root=project_root,
+            api_key=api_key,
+            jwt=active_jwt,
+            system_prompt=system_prompt,
+            tool_defs=tool_defs,
+            user_content=user_content,
+            max_turns=max_turns,
+            timeout_ms=timeout_ms,
+            actual_depth=actual_depth,
+            tree_size_bytes=tree_size_bytes,
+            fell_back=fell_back,
+            repo_map_meta=repo_map_meta,
+            on_progress=on_progress,
+        )
+
     try:
         with _remote_search_slot(on_progress=on_progress) as lock_wait_ms:
             if not jwt:
                 log("获取 JWT...")
+                jwt_started = time.perf_counter()
                 jwt = fetch_jwt(api_key)
-            result = _search_remote_models(
-                query=query,
-                project_root=project_root,
-                api_key=api_key,
-                jwt=jwt,
-                system_prompt=system_prompt,
-                tool_defs=tool_defs,
-                user_content=user_content,
-                max_turns=max_turns,
-                timeout_ms=timeout_ms,
-                actual_depth=actual_depth,
-                tree_size_bytes=tree_size_bytes,
-                fell_back=fell_back,
-                repo_map_meta=repo_map_meta,
-                on_progress=on_progress,
-            )
+                timing_ms["jwt"] = (time.perf_counter() - jwt_started) * 1000
+                jwt_cache_state = getattr(fetch_jwt, "last_cache", None) or "miss"
+            result = _run_remote(jwt)
+            if not supplied_jwt and _is_auth_error_result(result):
+                _invalidate_cached_jwt(api_key)
+                try:
+                    log("JWT 被拒绝，重新获取后重试一次")
+                    refetch_started = time.perf_counter()
+                    jwt = _request_user_jwt(api_key)
+                    _store_cached_jwt(api_key, jwt)
+                    timing_ms["jwt_refetch"] = (time.perf_counter() - refetch_started) * 1000
+                    jwt_cache_state = "refetch"
+                    result = _run_remote(jwt)
+                except Exception:
+                    jwt_cache_state = "refetch_failed"
             result.setdefault("_meta", {})["remote_lock_wait_ms"] = round(lock_wait_ms, 1)
-            return result
+            return _merge_timing(result, timing_ms, jwt_cache_state)
     except RemoteSearchBusy as exc:
-        return {
+        busy = {
             "files": [],
             "error": str(exc),
             "_meta": {
@@ -2098,6 +2354,7 @@ def search(
                 **repo_map_meta,
             },
         }
+        return _merge_timing(busy, timing_ms, jwt_cache_state)
 
 
 def _parse_answer(xml_text: str, project_root: str) -> Dict[str, Any]:
@@ -2279,6 +2536,52 @@ def _filter_signal_patterns(patterns: list[str], query_terms: list[str]) -> list
     return list(dict.fromkeys(kept))
 
 
+def _format_timing_line(meta: dict[str, Any] | None) -> str | None:
+    if not meta:
+        return None
+    timing = meta.get("timing_ms") or {}
+    labels = (
+        ("repo_map", "repo_map"),
+        ("lexical_anchors", "anchors"),
+        ("local_prefetch", "local_prefetch"),
+        ("local_rerank", "local_rerank"),
+        ("jwt", "jwt"),
+        ("jwt_refetch", "jwt_refetch"),
+        ("rate_limit", "rate_limit"),
+        ("remote", "remote"),
+        ("decision_layer", "decision_layer"),
+    )
+    parts: list[str] = []
+    for key, label in labels:
+        value = timing.get(key)
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            parts.append(f"{label}={value:.0f}ms")
+    if meta.get("jwt_cache"):
+        parts.append(f"jwt_cache={meta['jwt_cache']}")
+    if meta.get("rate_limit_cached"):
+        parts.append(f"rate_limit_cached={meta['rate_limit_cached']}")
+    lock_wait = meta.get("remote_lock_wait_ms")
+    if isinstance(lock_wait, (int, float)) and not isinstance(lock_wait, bool):
+        parts.append(f"lock_wait={lock_wait:.0f}ms")
+    if not parts:
+        return None
+    return "[timing] " + ", ".join(parts)
+
+
+def _extend_followup_terms(patterns: list[str], extra_terms: list[str] | None) -> list[str]:
+    if not extra_terms:
+        return patterns
+    merged = list(patterns)
+    seen = {item.lower() for item in merged}
+    for term in extra_terms:
+        text = term.strip()
+        if not text or text.lower() in seen:
+            continue
+        seen.add(text.lower())
+        merged.append(text)
+    return merged
+
+
 def _format_success_output(
     files: list[dict[str, Any]],
     query: str,
@@ -2292,12 +2595,15 @@ def _format_success_output(
     exclude_paths: list[str] | None,
     verbose: bool,
     salvaged: dict[str, Any] | None = None,
+    decision_text: str = "",
+    extra_terms: list[str] | None = None,
 ) -> str:
     query_terms = _extract_query_terms(query, max_terms=12)
     salvaged_files = (salvaged or {}).get("files") or []
     salvaged_patterns = (salvaged or {}).get("rg_patterns") or []
-    signal_patterns = _filter_signal_patterns(
-        list(rg_patterns) + list(salvaged_patterns), query_terms
+    signal_patterns = _extend_followup_terms(
+        _filter_signal_patterns(list(rg_patterns) + list(salvaged_patterns), query_terms),
+        extra_terms,
     )
     parts: list[str] = []
 
@@ -2335,8 +2641,12 @@ def _format_success_output(
                     parts.append(f"     anchor: {anchor}")
             parts.append("")
 
+    if decision_text.strip():
+        parts.append(decision_text.strip())
+        parts.append("")
+
     if not files and not salvaged_files:
-        if signal_patterns:
+        if signal_patterns or decision_text.strip():
             parts.append("No direct file matches found.")
             parts.append("")
         else:
@@ -2372,6 +2682,9 @@ def _format_success_output(
         if exclude_paths:
             config_line += f", exclude_paths=[{', '.join(exclude_paths)}]"
         parts.append(config_line)
+        timing_line = _format_timing_line(meta)
+        if timing_line:
+            parts.append(timing_line)
 
     while parts and not parts[-1]:
         parts.pop()
@@ -2397,6 +2710,9 @@ def _format_semble_output(
     project_root: str,
     verbose: bool = False,
     heading: str = "Local Semble results:",
+    decision_text: str = "",
+    extra_terms: list[str] | None = None,
+    timing_ms: dict[str, float] | None = None,
 ) -> str:
     results = payload.get("results") or []
     if not results:
@@ -2419,6 +2735,14 @@ def _format_semble_output(
             parts.append(f"     snippet: {snippet}")
         parts.append("")
 
+    if decision_text.strip():
+        parts.append(decision_text.strip())
+        parts.append("")
+    if extra_terms:
+        parts.append("Follow-up search terms:")
+        parts.append(", ".join(dict.fromkeys(term.strip() for term in extra_terms if term.strip())))
+        parts.append("")
+
     meta = payload.get("_meta") or {}
     if verbose and meta:
         runner = meta.get("runner", "unknown")
@@ -2427,6 +2751,10 @@ def _format_semble_output(
         if cache_status:
             detail += f", cache={cache_status}"
         parts.append(detail)
+    if verbose and timing_ms:
+        timing_line = _format_timing_line({"timing_ms": timing_ms})
+        if timing_line:
+            parts.append(timing_line)
 
     while parts and not parts[-1]:
         parts.pop()
@@ -2473,23 +2801,107 @@ def _format_semble_prompt_context(
     return "\n".join(lines)
 
 
+def _prefetch_top_k(max_results: int) -> int:
+    if max_results <= 0:
+        return max_results
+    return max_results * 2
+
+
+def _rerank_semble_payload(
+    payload: dict[str, Any],
+    query: str,
+    max_results: int,
+    content_types: list[str] | None,
+    anchor_paths: list[str] | None = None,
+) -> dict[str, Any]:
+    updated = dict(payload)
+    updated["results"] = rerank_local_results(
+        list(payload.get("results") or []),
+        query,
+        max_results=max_results,
+        anchor_paths=anchor_paths,
+        content_types=content_types,
+    )
+    return updated
+
+
+def _run_decision_layer(project_root: str, hits: list[dict], enabled: bool) -> DecisionLayerReport:
+    if not hits or not decision_layer_enabled(enabled):
+        return DecisionLayerReport()
+    try:
+        return build_decision_layer(project_root, hits)
+    except Exception:
+        return DecisionLayerReport(ran=True)
+
+
+def _render_ranked_local(
+    payload: dict[str, Any],
+    *,
+    query: str,
+    project_root: str,
+    max_results: int,
+    content_types: list[str] | None,
+    verbose: bool,
+    heading: str,
+    anchor_paths: list[str] | None = None,
+    decision_layer: bool = True,
+    extra_timing: dict[str, float] | None = None,
+) -> str:
+    rerank_started = time.perf_counter()
+    ranked = _rerank_semble_payload(
+        payload,
+        query,
+        max_results,
+        content_types,
+        anchor_paths,
+    )
+    rerank_ms = (time.perf_counter() - rerank_started) * 1000
+    report = _run_decision_layer(project_root, list(ranked.get("results") or []), decision_layer)
+    timing = {key: round(value, 1) for key, value in (extra_timing or {}).items()}
+    timing["local_rerank"] = round(rerank_ms, 1)
+    if report.ran:
+        timing["decision_layer"] = round(report.elapsed_ms, 1)
+    return _format_semble_output(
+        ranked,
+        project_root,
+        verbose=verbose,
+        heading=heading,
+        decision_text=report.text,
+        extra_terms=report.guard_symbols,
+        timing_ms=timing if verbose else None,
+    )
+
+
 def local_search_with_content(
     query: str,
     project_root: str,
     max_results: int = 10,
     content_types: list[str] | None = None,
     verbose: bool = False,
+    decision_layer: bool = True,
 ) -> str:
+    prefetch_started = time.perf_counter()
     try:
         payload = semble_search(
             query=query,
             project_root=project_root,
-            top_k=max_results,
+            top_k=_prefetch_top_k(max_results),
             content=content_types,
         )
     except SembleUnavailable as exc:
         return f"Error: local Semble unavailable: {exc}"
-    return _format_semble_output(payload, project_root, verbose=verbose)
+    prefetch_ms = (time.perf_counter() - prefetch_started) * 1000
+    return _render_ranked_local(
+        payload,
+        query=query,
+        project_root=project_root,
+        max_results=max_results,
+        content_types=content_types,
+        verbose=verbose,
+        heading="Local Semble results:",
+        decision_layer=decision_layer,
+        extra_timing={"local_prefetch": prefetch_ms},
+    )
 
 
 def find_related_with_content(
@@ -2547,6 +2959,9 @@ def _format_error_result(
             f"\n[config] max_turns={max_turns}, max_results={max_results}, "
             f"max_commands={max_commands}, timeout_ms={timeout_ms}"
         )
+        timing_line = _format_timing_line(meta)
+        if timing_line:
+            message += f"\n{timing_line}"
     if "AUTH_ERROR" in result["error"]:
         message += (
             "\n[hint] Windsurf 凭证可能已过期。覆盖当前凭据来源后重试："
@@ -2573,6 +2988,7 @@ def search_with_content(
     verbose: bool = False,
     backend: str = "hybrid",
     content_types: list[str] | None = None,
+    decision_layer: bool = True,
 ) -> str:
     """搜索并返回适合 CLI / skill 的格式化结果。"""
     if backend not in {"hybrid", "remote", "local"}:
@@ -2585,25 +3001,49 @@ def search_with_content(
             max_results=max_results,
             content_types=content_types,
             verbose=verbose,
+            decision_layer=decision_layer,
         )
 
     local_payload: dict[str, Any] | None = None
     local_context = ""
     local_error = ""
+    local_prefetch_ms = 0.0
     if backend == "hybrid":
         try:
+            prefetch_started = time.perf_counter()
             local_payload = semble_search(
                 query=query,
                 project_root=project_root,
-                top_k=max_results,
+                top_k=_prefetch_top_k(max_results),
                 content=content_types,
             )
-            local_context = _format_semble_prompt_context(
+            local_prefetch_ms = (time.perf_counter() - prefetch_started) * 1000
+            prompt_payload = _rerank_semble_payload(
                 local_payload,
+                query,
+                max_results,
+                content_types,
+            )
+            local_context = _format_semble_prompt_context(
+                prompt_payload,
                 max_chunks=min(max_results, 5),
             )
         except SembleUnavailable as exc:
             local_error = str(exc)
+
+    def _local_fallback(heading: str = "Local Semble results:") -> str:
+        assert local_payload is not None
+        return _render_ranked_local(
+            local_payload,
+            query=query,
+            project_root=project_root,
+            max_results=max_results,
+            content_types=content_types,
+            verbose=verbose,
+            heading=heading,
+            decision_layer=decision_layer,
+            extra_timing={"local_prefetch": local_prefetch_ms},
+        )
 
     try:
         result = search(
@@ -2619,7 +3059,7 @@ def search_with_content(
         )
     except Exception as exc:
         if backend == "hybrid" and local_payload:
-            local_output = _format_semble_output(local_payload, project_root, verbose=verbose)
+            local_output = _local_fallback()
             return f"Remote search unavailable: {exc}\nUsing local Semble results.\n\n{local_output}"
         if backend == "hybrid" and local_error:
             return f"Error: {exc}\n[local Semble unavailable] {local_error}"
@@ -2634,15 +3074,26 @@ def search_with_content(
             timeout_ms=timeout_ms,
         )
         if backend == "hybrid" and local_payload:
-            local_output = _format_semble_output(local_payload, project_root, verbose=verbose)
+            local_output = _local_fallback()
             return f"{remote_error}\n\nUsing local Semble results.\n\n{local_output}"
         if backend == "hybrid" and local_error:
             return f"{remote_error}\n[local Semble unavailable] {local_error}"
         return remote_error
 
     files = result.get("files", [])
+    salvaged = result.get("salvaged") or {}
+    decision_hits = list(files or salvaged.get("files") or [])
+    if not decision_hits and local_payload:
+        decision_hits = list(local_payload.get("results") or [])
+    report = _run_decision_layer(project_root, decision_hits, decision_layer)
+    meta = dict(result.get("_meta") or {})
+    timing = dict(meta.get("timing_ms") or {})
+    if backend == "hybrid":
+        timing["local_prefetch"] = round(local_prefetch_ms, 1)
+    if report.ran:
+        timing["decision_layer"] = round(report.elapsed_ms, 1)
+    meta["timing_ms"] = timing
     rg_patterns = result.get("rg_patterns", [])
-    meta = result.get("_meta") or {}
     remote_output = _format_success_output(
         files=files,
         query=query,
@@ -2655,14 +3106,33 @@ def search_with_content(
         timeout_ms=timeout_ms,
         exclude_paths=exclude_paths,
         verbose=verbose,
-        salvaged=result.get("salvaged"),
+        salvaged=salvaged,
+        decision_text=report.text,
+        extra_terms=report.guard_symbols,
     )
     if backend == "hybrid" and local_payload and (local_payload.get("results") or []):
+        anchors = [
+            str(entry.get("path") or "")
+            for entry in files
+            if isinstance(entry, dict) and entry.get("path")
+        ]
+        rerank_started = time.perf_counter()
+        display_payload = _rerank_semble_payload(
+            local_payload,
+            query,
+            min(max_results, 5),
+            content_types,
+            anchor_paths=anchors,
+        )
+        rerank_ms = (time.perf_counter() - rerank_started) * 1000
         local_output = _format_semble_output(
-            _limit_semble_payload(local_payload, min(max_results, 5)),
+            display_payload,
             project_root,
             verbose=verbose,
             heading="Local Semble chunk candidates:",
+            timing_ms={"local_prefetch": round(local_prefetch_ms, 1), "local_rerank": round(rerank_ms, 1)}
+            if verbose
+            else None,
         )
         return f"{remote_output}\n\n{local_output}"
     if backend == "hybrid" and local_error and verbose:
